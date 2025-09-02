@@ -6,9 +6,9 @@ import math
 import pandas as pd
 import numpy as np
 import mne
-from .config import HEPConfig
-from .ecg import detect_rpeaks, refine_with_rr_hint, add_rpeak_stim, save_ecg_qc_plot
-from .epochs import build_hep_epochs, save_hep_epochs
+from config import HEPConfig
+from ecg import detect_rpeaks, refine_with_rr_hint, add_rpeak_stim, save_ecg_qc_plot
+from epochs import build_hep_epochs, save_hep_epochs
 
 def _iter_inputs(input_glob) -> list[str]:
     if isinstance(input_glob, (list, tuple)):
@@ -82,12 +82,12 @@ def apply_qc_and_extract(cfg: HEPConfig) -> pd.DataFrame:
         try:
             raw = mne.io.read_raw_edf(f, preload=True, verbose=False) if f.lower().endswith(".edf") \
                 else mne.io.read_raw_fif(f, preload=True, verbose=False)
-            # full preprocessing (reuses your stable pipeline) :contentReference[oaicite:7]{index=7}
-            from .preprocess import apply_montage, clean_raw
+            # full preprocessing (reuses your stable pipeline)
+            from preprocess import apply_montage, clean_raw
             raw = apply_montage(raw, cfg)
             raw, prov = clean_raw(raw, cfg)
 
-            from .ecg import detect_rpeaks
+            from ecg import detect_rpeaks
             r, rr, ecg_clean = detect_rpeaks(raw, ecg_name=cfg.ecg_channel)
 
             if status in ("bad", "exclude", "skip"):
@@ -98,10 +98,10 @@ def apply_qc_and_extract(cfg: HEPConfig) -> pd.DataFrame:
                     r = refine_with_rr_hint(r, raw.info["sfreq"], rr_hint_s=rr_hint, factor=1.8)
                     rr = np.diff(r) / raw.info["sfreq"]
 
-            # add a stim channel for convenience (optional, helps viewing) :contentReference[oaicite:8]{index=8}
+            # add a stim channel for convenience (optional, helps viewing)
             add_rpeak_stim(raw, r, name="RPEAK")
 
-            from .epochs import build_hep_epochs, save_hep_epochs
+            from epochs import build_hep_epochs, save_hep_epochs
             hep = build_hep_epochs(raw, r, rr, cfg)
             path = save_hep_epochs(hep, outdir, cfg.save_stem, base)
             out_rows.append({"file": f, "base": base, "action": "saved", "epochs_fif": str(path),

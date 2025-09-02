@@ -6,7 +6,7 @@ import numpy as np
 import mne
 import neurokit2 as nk
 from matplotlib import pyplot as plt
-from .config import HEPConfig
+from config import HEPConfig
 
 # --- Pulled & adapted from your CFA pipeline (export QRS plot, RPEAK stim, present-RR) :contentReference[oaicite:6]{index=6}
 
@@ -87,4 +87,8 @@ def present_rr_metadata(event_samples: np.ndarray,
             s_next = r_sorted[i]
             rr_s = (s_next - s0) / sf
             pres_rr.append(rr_s)
-            has_nextR.append(bo_
+            has_nextR.append(bool(s_next - s0 <= win_len))
+        else:
+            pres_rr.append(np.nan)
+            has_nextR.append(False)
+    return {"present_rr_s": pres_rr, "has_next_r_in_window": has_nextR}

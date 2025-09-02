@@ -2,11 +2,11 @@
 from __future__ import annotations
 from typing import Tuple, Optional
 import mne
-from .config import HEPConfig
+from config import HEPConfig
 
 # Reuse your existing robust utilities (keeps behaviour consistent)
 # (from preprocessing.py in your codebase)
-from preprocessing import standardise_and_montage, run_pyprep, run_asr_ica  # :contentReference[oaicite:5]{index=5}
+from preprocessing import standardise_and_montage, run_pyprep, run_asr_ica
 
 def apply_montage(raw: mne.io.BaseRaw, cfg: HEPConfig) -> mne.io.BaseRaw:
     raw = standardise_and_montage(raw)  # robust name normalisation + montage selection

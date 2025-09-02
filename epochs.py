@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import mne
-from .config import HEPConfig
-from .ecg import present_rr_metadata
+from config import HEPConfig
+from ecg import present_rr_metadata
 
 def _amp_reject_indices(epochs: mne.Epochs, win: tuple[float, float], thresh_uv: float) -> list[int]:
     sf = epochs.info["sfreq"]
