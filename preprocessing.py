@@ -46,19 +46,14 @@ def standardise_and_montage(raw: mne.io.BaseRaw,
     
     return raw
 
-def run_pyprep(raw: mne.io.BaseRaw, random_seed: int = 42) -> mne.io.BaseRaw:
+def run_pyprep(raw: mne.io.BaseRaw, prep_params: dict, random_seed: int = 42) -> mne.io.BaseRaw:
     """Run PyPREP pipeline."""
     from pyprep import PrepPipeline
     
     prep = PrepPipeline(
         raw=raw, 
         montage=raw.get_montage(),
-        prep_params={
-            "ref_chs": "eeg", 
-            "reref_chs": "eeg",
-            "l_freq": 1.0, 
-            "h_freq": 100.0,
-        }, 
+        prep_params=prep_params,
         random_state=random_seed, 
         ransac=False, 
         channel_wise=True
