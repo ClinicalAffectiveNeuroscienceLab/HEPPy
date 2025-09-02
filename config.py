@@ -20,6 +20,14 @@ class HEPConfig:
     use_ica: bool = True
     random_seed: int = 42
     target_sfreq: Optional[float] = 256.0
+
+    # Pyprep parameters
+    line_freqs: Tuple[float, float] = (50.0, 100.0)
+    high_pass: float = 1.0
+    low_pass: float = 100.0
+    ref_chs: Union[str, list] = "eeg"
+    reref_chs: Union[str, list] = "eeg"
+    prep_ransac: bool = True
     
     # Montage
     montage_name: Optional[str] = "standard_1020"
@@ -51,7 +59,8 @@ def load_from_config_hep(module_name: str) -> HEPConfig:
                 # Skip imported modules/functions
                 if not callable(value) or attr in {
                     'input_glob', 'output_root', 'save_stem', 'qc_csv_name', 'qc_dirname',
-                    'use_pyprep', 'use_asr', 'use_ica', 'random_seed', 'target_sfreq',
+                    'use_pyprep', 'use_asr', 'use_ica', 'line_freqs', 'high_pass', 'low_pass',
+                    'ref_chs', 'reref_chs', 'prep_ransac', 'random_seed', 'target_sfreq',
                     'montage_name', 'rename_to_1020', 'tmin', 'tmax', 'baseline',
                     'amp_rej_uv', 'amp_window_s', 'min_rr_s', 'ecg_channel', 'stim_name', 'verbose'
                 }:
