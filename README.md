@@ -1,6 +1,8 @@
 # HEPPy
 
-This is a simple package for extracting the HEP from EEG data (with an ECG lead).
+# UNDER CONSTRUCTION
+
+This WILL BE a simple package for extracting the HEP from EEG data (with an ECG lead).
 
 It will run on a directory of EEG files in the form of .edf
 
@@ -11,4 +13,5 @@ It will run on a directory of EEG files in the form of .edf
 - asrpy
 - mne-icalabel
 - torch
+
 - pyprep
