@@ -1,6 +1,8 @@
 # HEPPy
 
-This is a simple package for extracting the HEP from EEG data (with an ECG lead).
+# UNDER CONSTRUCTION
+
+This WILL BE a simple package for extracting the HEP from EEG data (with an ECG lead).
 
 It will run on a directory of EEG files in the form of .edf
 
@@ -47,3 +49,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Citing
 If you use this code, please cite this repository. Please review this repository at time of using the
 code because there might be a paper to cite!
+=======
