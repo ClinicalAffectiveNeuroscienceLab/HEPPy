@@ -2,8 +2,8 @@
 from pathlib import Path
 
 # I/O - using test directory
-input_glob = "/tmp/test_data/*.edf"
-output_root = Path("/tmp/hep_output")
+input_glob = "test_files/*.fif"
+output_root = Path("test_files/hep_output")
 save_stem = "hep"
 qc_csv_name = "qc_review.csv"
 qc_dirname = "qc_plots"
@@ -24,7 +24,7 @@ tmin, tmax = -0.2, 0.8
 baseline = (-0.2, -0.05)
 amp_rej_uv = 150.0
 amp_window_s = (0.1, 0.5)
-min_rr_s = 0.7
+min_rr_s = 0.5
 ecg_channel = None
 stim_name = "STI 014"
 
