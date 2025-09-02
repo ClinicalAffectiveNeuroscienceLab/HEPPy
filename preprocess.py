@@ -2,19 +2,29 @@
 from __future__ import annotations
 from typing import Tuple, Optional
 import mne
-from .config import HEPConfig
+from config import HEPConfig
+
+prep_params = {
+    "line_freqs": HEPConfig.line_freqs if hasattr(HEPConfig, 'line_freqs') else [50, 100],
+    "high_pass": HEPConfig.high_pass if hasattr(HEPConfig, 'high_pass') else 1.0,
+    "low_pass": HEPConfig.low_pass if hasattr(HEPConfig, 'low_pass') else 100.0,
+    "ref_chs": HEPConfig.ref_chs if hasattr(HEPConfig, 'ref_chs') else "eeg",
+    "reref_chs": HEPConfig.reref_chs if hasattr(HEPConfig, 'reref_chs') else "eeg",
+    "prep_ransac": HEPConfig.prep_ransac if hasattr(HEPConfig, 'prep_ransac') else True,
+}
 
 # Reuse your existing robust utilities (keeps behaviour consistent)
 # (from preprocessing.py in your codebase)
-from preprocessing import standardise_and_montage, run_pyprep, run_asr_ica  # :contentReference[oaicite:5]{index=5}
+from preprocessing import standardise_and_montage, run_pyprep, run_asr_ica
 
 def apply_montage(raw: mne.io.BaseRaw, cfg: HEPConfig) -> mne.io.BaseRaw:
-    raw = standardise_and_montage(raw)  # robust name normalisation + montage selection
+    raw = standardise_and_montage(raw, cfg.montage_name, cfg.rename_to_1020)
     return raw
 
 def clean_raw(raw: mne.io.BaseRaw, cfg: HEPConfig) -> Tuple[mne.io.BaseRaw, dict]:
     prov = {
         "sfreq_in": float(raw.info["sfreq"]),
+        "use_pyprep": bool(cfg.use_pyprep),
         "use_pyprep": bool(cfg.use_pyprep),
         "use_asr": float(cfg.use_asr) if cfg.use_asr else None,
         "use_ica": bool(cfg.use_ica),
@@ -23,8 +33,13 @@ def clean_raw(raw: mne.io.BaseRaw, cfg: HEPConfig) -> Tuple[mne.io.BaseRaw, dict
 
     eeg = raw.copy()
     if cfg.use_pyprep:
-        eeg = run_pyprep(eeg, random_seed=cfg.random_seed)
-    eeg = run_asr_ica(eeg, asr_thresh=cfg.use_asr, random_seed=cfg.random_seed)
+        eeg = run_pyprep(eeg, prep_params=prep_params, random_seed=cfg.random_seed)
+    
+    if cfg.use_asr or cfg.use_ica:
+        eeg = run_asr_ica(eeg, asr_thresh=cfg.use_asr, use_ica=cfg.use_ica, random_seed=cfg.random_seed)
+    else:
+        # Just apply average reference if no ASR/ICA
+        eeg, _ = mne.set_eeg_reference(eeg, ref_channels='average')
 
     # resample if requested
     if cfg.target_sfreq and eeg.info["sfreq"] != cfg.target_sfreq:

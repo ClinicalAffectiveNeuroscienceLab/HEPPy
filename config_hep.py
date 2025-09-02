@@ -16,6 +16,14 @@ use_ica         = True
 random_seed     = 42
 target_sfreq    = 256       # resample after filtering; set None to keep native
 
+# Pyprep parameters
+line_freqs = (50, 100)  # Not used in test
+high_pass = 1.0         # Not used in test
+low_pass = 100.0        # Not used in test
+ref_chs = "eeg"
+reref_chs = "eeg"
+prep_ransac = True
+
 # Montage / channels
 montage_name    = "standard_1020"  # or 'biosemi128', etc. - or a csutom montage file path
 rename_to_1020  = True             # light renaming (best‑effort)

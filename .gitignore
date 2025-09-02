@@ -1,0 +1,32 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Test and temporary files
+/tmp/
+*.tmp
+*.log
+
+# Development files
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+
+# Output files from testing
+test_output/
+hep_output/
+qc_plots/
+*.fif
+*.npz
+*_cache.json
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
