@@ -43,11 +43,19 @@ def load_from_config_hep(module_name: str) -> HEPConfig:
     try:
         mod = importlib.import_module(module_name)
         
-        # Extract attributes from the config module
+        # Extract attributes from the config module, excluding built-ins and imports
         config_dict = {}
         for attr in dir(mod):
-            if not attr.startswith('_'):
-                config_dict[attr] = getattr(mod, attr)
+            if not attr.startswith('_') and attr != 'Path':  # Exclude Path import
+                value = getattr(mod, attr)
+                # Skip imported modules/functions
+                if not callable(value) or attr in {
+                    'input_glob', 'output_root', 'save_stem', 'qc_csv_name', 'qc_dirname',
+                    'use_pyprep', 'use_asr', 'use_ica', 'random_seed', 'target_sfreq',
+                    'montage_name', 'rename_to_1020', 'tmin', 'tmax', 'baseline',
+                    'amp_rej_uv', 'amp_window_s', 'min_rr_s', 'ecg_channel', 'stim_name', 'verbose'
+                }:
+                    config_dict[attr] = value
         
         # Convert paths
         if 'output_root' in config_dict:

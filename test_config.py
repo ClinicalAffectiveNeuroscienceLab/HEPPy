@@ -10,13 +10,13 @@ qc_dirname = "qc_plots"
 
 # Preproc toggles
 use_pyprep = False  # Disable for faster testing
-use_asr = False     # Disable for faster testing
-use_ica = False     # Disable for faster testing
+use_asr = False     # Disable for faster testing  
+use_ica = False     # Disable for testing (requires montage)
 random_seed = 42
 target_sfreq = 256
 
 # Montage / channels
-montage_name = "standard_1020"
+montage_name = None  # Disable montage for test data
 rename_to_1020 = True
 
 # Epoching / rejection

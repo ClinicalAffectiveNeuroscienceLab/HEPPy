@@ -23,20 +23,26 @@ def standardise_and_montage(raw: mne.io.BaseRaw,
                 raw.set_channel_types({ch: 'ecg'})
     
     if montage_name:
-        if isinstance(montage_name, (str, Path)) and Path(str(montage_name)).exists():
-            mont = mne.channels.read_custom_montage(str(montage_name))
-        else:
-            mont = mne.channels.make_standard_montage(str(montage_name))
-        
-        # Filter to keep only channels in montage
-        eeg_names = [ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t == 'eeg']
-        keep_for_mont = [ch for ch in eeg_names if ch in mont.ch_names]
-        if keep_for_mont:
-            other_chs = [ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) 
-                        if t in ('ecg', 'stim') and ch not in keep_for_mont]
-            raw.pick(keep_for_mont + other_chs)
-        
-        raw.set_montage(mont, match_case=False)
+        try:
+            if isinstance(montage_name, (str, Path)) and Path(str(montage_name)).exists():
+                mont = mne.channels.read_custom_montage(str(montage_name))
+            else:
+                mont = mne.channels.make_standard_montage(str(montage_name))
+            
+            # Filter to keep only channels in montage
+            eeg_names = [ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t == 'eeg']
+            keep_for_mont = [ch for ch in eeg_names if ch in mont.ch_names]
+            if keep_for_mont:
+                other_chs = [ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) 
+                            if t in ('ecg', 'stim') and ch not in keep_for_mont]
+                raw.pick(keep_for_mont + other_chs)
+                raw.set_montage(mont, match_case=False)
+            else:
+                # No matching channels, skip montage but keep all channels
+                print(f"Warning: No channels match montage {montage_name}, proceeding without montage")
+        except Exception as e:
+            print(f"Warning: Failed to set montage {montage_name}: {e}")
+            # Continue without montage
     
     return raw
 
@@ -68,6 +74,7 @@ def run_pyprep(raw: mne.io.BaseRaw, random_seed: int = 42) -> mne.io.BaseRaw:
 
 def run_asr_ica(raw: mne.io.BaseRaw, 
                 asr_thresh: Optional[float] = 20.0, 
+                use_ica: bool = True,
                 random_seed: int = 42) -> mne.io.BaseRaw:
     """Run ASR and ICA cleaning."""
     # Average reference
@@ -85,33 +92,34 @@ def run_asr_ica(raw: mne.io.BaseRaw,
         raw._data[eeg_picks] = asr.transform(raw.copy().pick('eeg')).get_data()
     
     # ICA with ICLabel
-    from mne.preprocessing import ICA
-    try:
-        from mne_icalabel import label_components
-        
-        eeg = raw.copy().pick('eeg')
-        n_comp = min(len(eeg.ch_names) - len(eeg.info['bads']) - 1, 48)
-        
-        ica = ICA(
-            n_components=n_comp, 
-            method='infomax', 
-            random_state=random_seed, 
-            fit_params={"extended": True}
-        )
-        ica.fit(eeg, decim=3)
-        
-        # Label components
-        labels = label_components(eeg, ica, method='iclabel')['labels']
-        bads = [i for i, lab in enumerate(labels) if lab not in ('brain', 'other')]
-        ica.exclude = bads
-        
-        # Apply ICA cleaning
-        eeg_clean = ica.apply(eeg)
-        eeg_picks = mne.pick_types(raw.info, eeg=True)
-        raw._data[eeg_picks] = eeg_clean.get_data()
-        
-    except ImportError:
-        print("Warning: mne_icalabel not available, skipping ICA cleaning")
+    if use_ica:
+        from mne.preprocessing import ICA
+        try:
+            from mne_icalabel import label_components
+            
+            eeg = raw.copy().pick('eeg')
+            n_comp = min(len(eeg.ch_names) - len(eeg.info['bads']) - 1, 48)
+            
+            ica = ICA(
+                n_components=n_comp, 
+                method='infomax', 
+                random_state=random_seed, 
+                fit_params={"extended": True}
+            )
+            ica.fit(eeg, decim=3)
+            
+            # Label components
+            labels = label_components(eeg, ica, method='iclabel')['labels']
+            bads = [i for i, lab in enumerate(labels) if lab not in ('brain', 'other')]
+            ica.exclude = bads
+            
+            # Apply ICA cleaning
+            eeg_clean = ica.apply(eeg)
+            eeg_picks = mne.pick_types(raw.info, eeg=True)
+            raw._data[eeg_picks] = eeg_clean.get_data()
+            
+        except ImportError:
+            print("Warning: mne_icalabel not available, skipping ICA cleaning")
     
     # Interpolate bad channels
     raw.interpolate_bads(reset_bads=False)

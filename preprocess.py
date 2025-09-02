@@ -9,7 +9,7 @@ from config import HEPConfig
 from preprocessing import standardise_and_montage, run_pyprep, run_asr_ica
 
 def apply_montage(raw: mne.io.BaseRaw, cfg: HEPConfig) -> mne.io.BaseRaw:
-    raw = standardise_and_montage(raw)  # robust name normalisation + montage selection
+    raw = standardise_and_montage(raw, cfg.montage_name, cfg.rename_to_1020)
     return raw
 
 def clean_raw(raw: mne.io.BaseRaw, cfg: HEPConfig) -> Tuple[mne.io.BaseRaw, dict]:
@@ -24,7 +24,12 @@ def clean_raw(raw: mne.io.BaseRaw, cfg: HEPConfig) -> Tuple[mne.io.BaseRaw, dict
     eeg = raw.copy()
     if cfg.use_pyprep:
         eeg = run_pyprep(eeg, random_seed=cfg.random_seed)
-    eeg = run_asr_ica(eeg, asr_thresh=cfg.use_asr, random_seed=cfg.random_seed)
+    
+    if cfg.use_asr or cfg.use_ica:
+        eeg = run_asr_ica(eeg, asr_thresh=cfg.use_asr, use_ica=cfg.use_ica, random_seed=cfg.random_seed)
+    else:
+        # Just apply average reference if no ASR/ICA
+        eeg, _ = mne.set_eeg_reference(eeg, ref_channels='average')
 
     # resample if requested
     if cfg.target_sfreq and eeg.info["sfreq"] != cfg.target_sfreq:

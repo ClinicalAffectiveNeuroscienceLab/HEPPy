@@ -10,16 +10,59 @@ from config import HEPConfig
 
 # --- Pulled & adapted from your CFA pipeline (export QRS plot, RPEAK stim, present-RR) :contentReference[oaicite:6]{index=6}
 
-def save_ecg_qc_plot(ecg_signal: np.ndarray, sf: float, save_path: Path) -> None:
-    """Save NeuroKit2 ECG QC plot (R-peaks etc.)."""
+def save_ecg_qc_plot(ecg_signal: np.ndarray, sf: float, save_path: Path, 
+                     r_peaks: Optional[np.ndarray] = None, 
+                     title_suffix: str = "") -> None:
+    """Save NeuroKit2 ECG QC plot (R-peaks etc.).
+    
+    Parameters
+    ----------
+    ecg_signal : np.ndarray
+        Clean ECG signal
+    sf : float
+        Sampling frequency
+    save_path : Path
+        Output path for the plot
+    r_peaks : np.ndarray, optional
+        Custom R-peak locations (in samples). If None, auto-detects.
+    title_suffix : str
+        Additional text to add to plot title
+    """
     try:
-        signals, info = nk.ecg_process(ecg_signal, sampling_rate=int(sf))
-        nk.ecg_plot(signals, info)
-        fig = plt.gcf()
-        fig.set_size_inches(10, 12, forward=True)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(str(save_path), dpi=150)
-        plt.close(fig)
+        if r_peaks is not None:
+            # For custom R-peaks, create a simple matplotlib plot
+            t = np.arange(len(ecg_signal)) / sf
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(t, ecg_signal, 'b-', linewidth=0.8, label='ECG')
+            
+            # Mark R-peaks
+            valid_peaks = r_peaks[(r_peaks >= 0) & (r_peaks < len(ecg_signal))]
+            if len(valid_peaks) > 0:
+                ax.plot(valid_peaks / sf, ecg_signal[valid_peaks], 'ro', markersize=4, label='R-peaks')
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Amplitude')
+            ax.set_title(f'ECG with R-peaks {title_suffix}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(str(save_path), dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            # Auto-detect R-peaks using NeuroKit2
+            signals_df, info = nk.ecg_process(ecg_signal, sampling_rate=int(sf))
+            nk.ecg_plot(signals_df, info)
+            fig = plt.gcf()
+            fig.set_size_inches(10, 12, forward=True)
+            
+            # Add title suffix if provided
+            if title_suffix:
+                fig.suptitle(f"ECG Analysis {title_suffix}", fontsize=14)
+            
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(str(save_path), dpi=150)
+            plt.close(fig)
     except Exception as err:
         print(f"[heppy] ECG QC plot failed: {err}")
 
