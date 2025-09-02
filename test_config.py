@@ -9,11 +9,19 @@ qc_csv_name = "qc_review.csv"
 qc_dirname = "qc_plots"
 
 # Preproc toggles
-use_pyprep = False  # Disable for faster testing
-use_asr = False     # Disable for faster testing  
-use_ica = False     # Disable for testing (requires montage)
+use_pyprep = True  # Disable for faster testing
+use_asr = True     # Disable for faster testing
+use_ica = True     # Disable for testing (requires montage)
 random_seed = 42
 target_sfreq = 256
+
+# Pyprep parameters
+line_freqs = (50, 100)  # Not used in test
+high_pass = 1.0         # Not used in test
+low_pass = 100.0        # Not used in test
+ref_chs = "eeg"
+reref_chs = "eeg"
+prep_ransac = False
 
 # Montage / channels
 montage_name = None  # Disable montage for test data
