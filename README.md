@@ -159,6 +159,10 @@ heppy_output/
 * **HEP runs but summary shows many `error` rows**
   Look in `heppy_output/logs/error_###_log.txt` for each failing file. Each log contains the full traceback, config snapshot, and the offending file path.
 
+## Known issues:
+1. ASRPY is no longer supported - sometimes there are indexing errors in it, I think due to edge cases with data arrays - currently not in scope to solve.
+2. If you rerun it on the same directory it gets confused.
+
 ---
 
 ## Development tips
@@ -200,4 +204,5 @@ python -m heppy.main
 ```
 
 That’s it.
+
 
