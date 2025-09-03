@@ -2,19 +2,19 @@
 
 # This is an example config - you will need to consider the contents carefully
 
-from pathlib import Path
-
 # I/O
-input_glob      = r"D:/RootFolder/**/*.edf"   # or a list of paths
-output_root     = Path(r"D:/RootFolder/HEP_output")
 save_stem       = "hep"                    # controls file names
+input_glob = "*.edf"  # Adjust as needed
+output_root    = "./output"              # will be created if needed
+qc_csv_name    = "qc_review.csv"         # summary CSV of QC metrics
+qc_dirname     = "qc_plots"              # directory for QC figures
 
 # Preproc toggles
 use_pyprep      = True
-use_asr         = 20        # ASR cutoff in SD; set False/None to disable
+use_asr         = 15        # ASR cutoff in SD; set False/None to disable
 use_ica         = True
 random_seed     = 42
-target_sfreq    = 256       # resample after filtering; set None to keep native
+target_sfreq    = 100       # resample after filtering; set None to keep native
 
 # Pyprep parameters
 line_freqs = (50, 100)  # Not used in test
@@ -23,6 +23,9 @@ low_pass = 100.0        # Not used in test
 ref_chs = "eeg"
 reref_chs = "eeg"
 prep_ransac = True
+
+# HRV
+do_hrv          = True  # set False to disable
 
 # Montage / channels
 montage_name    = "standard_1020"  # or 'biosemi128', etc. - or a csutom montage file path

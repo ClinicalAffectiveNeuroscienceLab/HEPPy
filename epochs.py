@@ -20,34 +20,56 @@ def build_hep_epochs(raw: mne.io.BaseRaw,
                      r_peaks: np.ndarray,
                      rr_sec: np.ndarray,
                      cfg: HEPConfig) -> mne.Epochs:
-    """Create HEP epochs using the present-RR rule; attach metadata; reject by amplitude."""
-    # Present-RR filter
+    """Create HEP epochs using the present-RR rule; attach metadata; reject by amplitude.
+
+    Assumes r_peaks are sample indices aligned to raw.info['sfreq'].
+    """
+    sfreq = float(raw.info["sfreq"])
+
+    # Basic sanity: ensure peaks are in bounds after any upstream resampling.
+    if r_peaks.size and (r_peaks.min() < 0 or r_peaks.max() >= raw.n_times):
+        raise RuntimeError(
+            "R-peak indices are out of bounds for this Raw object. "
+            "This usually indicates a sampling-rate mismatch; ensure cached peaks "
+            "were rescaled to the current sfreq before calling build_hep_epochs()."
+        )
+
+    # Present-RR filter (rr_sec must correspond to current sfreq too)
     keep = rr_sec >= cfg.min_rr_s
-    if not keep.any():
+    if not np.any(keep):
         raise RuntimeError("No HEP-valid events (present RR >= min_rr_s).")
-    hep_peaks = np.asarray(r_peaks)[:-1][keep]
+    hep_peaks = np.asarray(r_peaks, dtype=int)[:-1][keep]
     events = np.c_[hep_peaks, np.zeros_like(hep_peaks), np.ones_like(hep_peaks)]
 
     picks = mne.pick_types(raw.info, eeg=True, ecg=True, stim=True)
-    epo = mne.Epochs(raw, events, tmin=cfg.tmin, tmax=cfg.tmax,
-                     baseline=cfg.baseline, picks=picks, preload=True, verbose=False)
+    epo = mne.Epochs(
+        raw,
+        events,
+        tmin=cfg.tmin,
+        tmax=cfg.tmax,
+        baseline=cfg.baseline,
+        picks=picks,
+        preload=True,
+        verbose=False,
+    )
 
-    # Amp rejection
+    # Amplitude rejection
     bad = _amp_reject_indices(epo, cfg.amp_window_s, cfg.amp_rej_uv)
     if bad:
         epo.drop(bad, reason=f"EEG>{cfg.amp_rej_uv}uV")
 
     # Metadata: present RR + has_nextR
-    md = present_rr_metadata(epo.events[:, 0], r_peaks, raw.info["sfreq"], cfg.tmin, cfg.tmax)
+    md = present_rr_metadata(epo.events[:, 0], r_peaks, sfreq, cfg.tmin, cfg.tmax)
     try:
         import pandas as pd
         epo.metadata = pd.DataFrame(md)
     except Exception:
         pass
 
-    # Set a stable meas_date for saving consistency
+    # Stable meas_date for saving consistency
     epo.set_meas_date(1)
     return epo
+
 
 def save_hep_epochs(epo: mne.Epochs, outdir: Path, save_stem: str, base: str) -> Path:
     outdir.mkdir(parents=True, exist_ok=True)

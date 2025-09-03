@@ -1,9 +1,9 @@
 # heppy/config.py
-from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
+
 
 @dataclass
 class HEPConfig:
@@ -13,7 +13,7 @@ class HEPConfig:
     save_stem: str = "hep"
     qc_csv_name: str = "qc_review.csv"
     qc_dirname: str = "qc_plots"
-    
+
     # Preprocessing
     use_pyprep: bool = True
     use_asr: Optional[float] = 20.0
@@ -28,11 +28,11 @@ class HEPConfig:
     ref_chs: Union[str, list] = "eeg"
     reref_chs: Union[str, list] = "eeg"
     prep_ransac: bool = True
-    
+
     # Montage
     montage_name: Optional[str] = "standard_1020"
     rename_to_1020: bool = True
-    
+
     # Epoching
     tmin: float = -0.2
     tmax: float = 0.8
@@ -42,34 +42,33 @@ class HEPConfig:
     min_rr_s: float = 0.7
     ecg_channel: Optional[str] = None
     stim_name: str = "STI 014"
-    
+
+    # HRV
+    do_hrv: bool = False
+
     # Logging
     verbose: bool = True
+
 
 def load_from_config_hep(module_name: str) -> HEPConfig:
     """Load configuration from a Python module."""
     try:
         mod = importlib.import_module(module_name)
-        
-        # Extract attributes from the config module, excluding built-ins and imports
         config_dict = {}
         for attr in dir(mod):
-            if not attr.startswith('_') and attr != 'Path':  # Exclude Path import
+            if not attr.startswith('_') and attr != 'Path':
                 value = getattr(mod, attr)
-                # Skip imported modules/functions
-                if not callable(value) or attr in {
-                    'input_glob', 'output_root', 'save_stem', 'qc_csv_name', 'qc_dirname',
-                    'use_pyprep', 'use_asr', 'use_ica', 'line_freqs', 'high_pass', 'low_pass',
-                    'ref_chs', 'reref_chs', 'prep_ransac', 'random_seed', 'target_sfreq',
-                    'montage_name', 'rename_to_1020', 'tmin', 'tmax', 'baseline',
-                    'amp_rej_uv', 'amp_window_s', 'min_rr_s', 'ecg_channel', 'stim_name', 'verbose'
-                }:
+                # Avoid importing callables from the module as config values
+                if not callable(value):
                     config_dict[attr] = value
-        
-        # Convert paths
+
         if 'output_root' in config_dict:
             config_dict['output_root'] = Path(config_dict['output_root'])
-            
         return HEPConfig(**config_dict)
     except Exception as e:
         raise RuntimeError(f"Failed to load config from {module_name}: {e}")
+
+if __name__ == "__main__":
+    # Example usage
+    config = load_from_config_hep("config_hep")
+    print(config)
