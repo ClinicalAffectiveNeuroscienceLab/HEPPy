@@ -1,7 +1,3 @@
-Here’s a **complete, copy-pasteable `README.md`** that documents HEPPy end-to-end, including truly beginner-proof install steps (Windows/macOS/Linux), what to click in the GUI, what the config options mean (including the new `do_hrv` flag), what files you’ll get out, and troubleshooting.
-
----
-
 # HEPPy — Heartbeat-Evoked Potential (HEP) extraction for EEG
 
 HEPPy is a small, practical pipeline for extracting heartbeat-evoked potentials (HEPs) from EEG recordings that include an ECG channel. It provides a **thin GUI** to:
@@ -23,133 +19,6 @@ Outputs are standard MNE objects on disk plus a summary CSV. Optionally, HEPPy c
 * **Error logs per file** with full Python tracebacks.
 * **Optional HRV metrics** (time/frequency/non-linear) with `do_hrv = True`.
 * Works with **EDF** or **FIF** inputs; handles typical montages.
-
----
-
-## Quick start (for absolute beginners)
-
-### 0) If you don’t have Python
-
-**Recommended**: install **Mambaforge** (it gives you Python and a clean package manager):
-
-* **Windows**
-
-  1. Download “Mambaforge” (x86\_64) from the official conda-forge page.
-  2. Run the installer (accept defaults).
-  3. Open **“Miniforge Prompt”** or **PowerShell**.
-
-* **macOS (Intel or Apple Silicon)**
-
-  1. Download the **Mambaforge** installer for your chip (x86\_64 or arm64).
-  2. Run it (allow in Security & Privacy if needed).
-  3. Open **Terminal**.
-
-* **Linux**
-
-  1. Download the **Mambaforge** installer for your architecture.
-  2. Run: `bash Mambaforge-*.sh` and follow prompts.
-  3. Open your terminal.
-
-> If you already use conda/Miniconda/Anaconda, you can skip installing Mambaforge and use your existing setup; just replace `mamba` with `conda` below.
-
----
-
-### 1) Create an isolated environment
-
-Open your shell (PowerShell/Terminal) and run:
-
-```bash
-mamba create -n heppy python=3.11 -y
-mamba activate heppy
-```
-
-> If `mamba` isn’t available, use `conda` instead.
-
----
-
-### 2) Install HEPPy’s dependencies
-
-#### Option A: one-by-one (simplest)
-
-```bash
-# core scientific stack
-mamba install -y numpy pandas pillow
-
-# MNE & companions
-mamba install -y mne
-pip install mne-icalabel
-
-# ECG / HRV tools
-pip install neurokit2 asrpy
-
-# Preprocessing
-pip install pyprep
-
-# (Optional) PyTorch – CPU-only (safe default)
-pip install --index-url https://download.pytorch.org/whl/cpu torch
-```
-
-> If you have an NVIDIA GPU and know your CUDA version, install the matching PyTorch build from the official instructions. If in doubt, **use the CPU command above**.
-
-#### Option B: environment file (reproducible)
-
-Create a file named `environment.yml`:
-
-```yaml
-name: heppy
-channels: [conda-forge]
-dependencies:
-  - python=3.11
-  - numpy
-  - pandas
-  - pillow
-  - mne
-  - pip
-  - pip:
-      - mne-icalabel
-      - neurokit2
-      - asrpy>=0.0.8
-      - pyprep
-      - torch==2.*; platform_system!="Windows"  # (optional, see PyTorch site)
-```
-
-Then:
-
-```bash
-mamba env create -f environment.yml
-mamba activate heppy
-```
-
-> On Windows, prefer the **Option A** commands for PyTorch (CPU) to avoid CUDA hassles.
-
----
-
-### 3) Get the code
-
-Clone or download this repository, then in your shell:
-
-```bash
-cd /path/to/your/HEPPy
-mamba activate heppy
-```
-
-> If you downloaded a ZIP, extract it first and `cd` into the extracted folder.
-
----
-
-### 4) Run the GUI
-
-From the project root:
-
-```bash
-python -m heppy.main
-```
-
-(or equivalently: `python heppy/main.py`)
-
-The window **“HEPPy – HEP QC & Extraction”** will open.
-
----
 
 ## How to use the GUI (step-by-step)
 
@@ -331,3 +200,4 @@ python -m heppy.main
 ```
 
 That’s it.
+
