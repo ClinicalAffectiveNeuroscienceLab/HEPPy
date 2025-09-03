@@ -22,22 +22,23 @@ Outputs are standard MNE objects on disk plus a summary CSV. Optionally, HEPPy c
 
 ## How to use the GUI (step-by-step)
 
-1. **Config key**: leave as `config` unless you have a different config module name (see **Configuration**).
-2. **Select Input Directory…**: choose the folder containing your EEG files.
+Enter the following:
+**Config key**: leave as `config` unless you have a different config module name (see **Configuration**).
+**Select Input Directory…**: choose the folder containing your EEG files.
+  * Supported: `*.edf`, `*-raw.fif`, and `*.fif` (customise via “Globs”).
+*(optional)* **Output dir**: set a different output folder; otherwise HEPPy will use `<input>/heppy_output`.
 
-   * Supported: `*.edf`, `*-raw.fif`, and `*.fif` (customise via “Globs”).
-3. *(optional)* **Output dir**: set a different output folder; otherwise HEPPy will use `<input>/heppy_output`.
-4. **1) Run QC**
+**1) Run QC**
 
    * Detects R-peaks per file.
    * Writes a QC CSV (default `qc_review.csv`) and QRS PNGs (`qc_plots/*_ecg_qc.png`).
-5. **2) Start Review**
+**2) Start Review**
 
    * The right panel shows one QC PNG at a time.
    * Mark **GOOD** or **BAD**.
    * If **BAD**, enter an **RR estimate** (in seconds, e.g. `0.8`).
    * Use **Previous/Next**, and **Save QC CSV** whenever you like.
-6. **3) Run HEP**
+**3) Run HEP**
 
    * Runs the full HEP extraction using your QC decisions.
    * Shows a determinate progress bar (files processed / total).
@@ -134,6 +135,14 @@ heppy_output/
    * **If `do_hrv=True`**, computes HRV metrics from R-peaks (at the current sampling rate) and appends to the summary row.
    * On any per-file failure, writes a **full traceback log** in `output_root/logs/` and notes it in the summary.
 
+# To Do:
+[x] - Add GUI
+[x] - Add Logging
+[x] - Add HRV
+[ ] - Add plotting
+[ ] - Fix asrpy errors
+[ ] - Add statistical methods
+
 ---
 
 ## Troubleshooting
@@ -204,5 +213,6 @@ python -m heppy.main
 ```
 
 That’s it.
+
 
 
