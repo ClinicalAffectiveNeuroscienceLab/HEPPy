@@ -77,6 +77,15 @@ def run_asr_ica(raw: mne.io.BaseRaw,
     
     # ASR
     if asr_thresh:
+        if type(asr_thresh) == float:
+            pass
+        elif type(asr_thresh) == int:
+            asr_thresh = float(asr_thresh)
+        elif type(asr_thresh) == bool and asr_thresh:
+            asr_thresh = 20.0
+        else:
+            raise ValueError("asr_thresh must be numerical or True/False")
+        print("Running ASR with threshold:", asr_thresh)
         import asrpy
         asr = asrpy.ASR(sfreq=raw.info['sfreq'], cutoff=asr_thresh)
         # Fit on downsampled data for efficiency
@@ -88,12 +97,13 @@ def run_asr_ica(raw: mne.io.BaseRaw,
     
     # ICA with ICLabel
     if use_ica:
+        print("Running ICA with ICLabel")
         from mne.preprocessing import ICA
         try:
             from mne_icalabel import label_components
             
             eeg = raw.copy().pick('eeg')
-            n_comp = min(len(eeg.ch_names) - len(eeg.info['bads']) - 1, 48)
+            n_comp = min(len(eeg.ch_names) - len(eeg.info['bads']) - 1, 40)
             
             ica = ICA(
                 n_components=n_comp, 

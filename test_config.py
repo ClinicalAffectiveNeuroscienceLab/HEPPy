@@ -1,17 +1,15 @@
 # Test configuration for HEPPy
-from pathlib import Path
 
-# I/O - using test directory
-input_glob = "test_files/*.fif"
-output_root = Path("test_files/hep_output")
 save_stem = "hep"
 qc_csv_name = "qc_review.csv"
 qc_dirname = "qc_plots"
+output_root = "./output"
+input_glob = "*.fif"  # Adjust as needed
 
 # Preproc toggles
-use_pyprep = True  # Disable for faster testing
-use_asr = True     # Disable for faster testing
-use_ica = True     # Disable for testing (requires montage)
+use_pyprep = False  # Disable for faster testing
+use_asr = False     # Disable for faster testing
+use_ica = False     # Disable for testing (requires montage)
 random_seed = 42
 target_sfreq = 256
 
@@ -22,6 +20,9 @@ low_pass = 100.0        # Not used in test
 ref_chs = "eeg"
 reref_chs = "eeg"
 prep_ransac = False
+
+# HRV
+do_hrv   = True  # set False to disable
 
 # Montage / channels
 montage_name = None  # Disable montage for test data

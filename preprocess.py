@@ -33,6 +33,7 @@ def clean_raw(raw: mne.io.BaseRaw, cfg: HEPConfig) -> Tuple[mne.io.BaseRaw, dict
 
     eeg = raw.copy()
     if cfg.use_pyprep:
+        print(f"Running PREP with params: {prep_params}")
         eeg = run_pyprep(eeg, prep_params=prep_params, random_seed=cfg.random_seed)
     
     if cfg.use_asr or cfg.use_ica:
