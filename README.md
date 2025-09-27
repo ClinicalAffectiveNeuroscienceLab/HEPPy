@@ -1,5 +1,7 @@
 # HEPPy — Heartbeat-Evoked Potential (HEP) extraction for EEG
 
+==N.B. Major update imminent with better R peak handling==
+
 HEPPy is a small, practical pipeline for extracting heartbeat-evoked potentials (HEPs) from EEG recordings that include an ECG channel. It provides a **thin GUI** to:
 
 1. run **QC** to detect R-peaks and generate per-file QRS plots;
@@ -213,6 +215,7 @@ python -m heppy.main
 ```
 
 That’s it.
+
 
 
 
