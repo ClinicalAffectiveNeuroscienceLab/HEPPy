@@ -1,10 +1,10 @@
 # HEPPy — Heartbeat-Evoked Potential (HEP) extraction for EEG
 
-==N.B. Major update imminent with better R peak handling==
+## N.B. Major update imminent with better R peak handling - also, while this was originally used with ASRPy, that repository is no longer supported or updated, so other methods are recommended.
 
-HEPPy is a small, practical pipeline for extracting heartbeat-evoked potentials (HEPs) from EEG recordings that include an ECG channel. It provides a **thin GUI** to:
+HEPPy is a simple, user friendly pipeline for extracting heartbeat-evoked potentials (HEPs) from EEG recordings that include an ECG channel. It provides a **thin GUI** to:
 
-1. run **QC** to detect R-peaks and generate per-file QRS plots;
+1. run **ecg analysis** to detect R-peaks and generate per-file QRS plots;
 2. **review** those plots and mark each file **GOOD** or **BAD** (with optional RR estimate for the bad ones);
 3. run **HEP** extraction using your QC decisions.
 
@@ -68,7 +68,7 @@ HEPPy loads a Python module (default key: `config`) into a `HEPConfig`. You’ll
 | `min_rr_s`     | `0.7`             | Only R-peaks with **present RR** ≥ this are considered for HEP.                          |
 | `ecg_channel`  | `None` or `"ECG"` | ECG channel name (if `None`, detector searches heuristically).                           |
 | `stim_name`    | `"STI 014"`       | Name for the generated stim channel marking R-peaks.                                     |
-| `do_hrv`       | `False` / `True`  | **NEW**: if `True`, compute HRV metrics (time/freq/non-linear) and add to summary CSV.   |
+| `do_hrv`       | `False` / `True`  | If `True`, compute HRV metrics (time/freq/non-linear) and add to summary CSV.   |
 | `verbose`      | `True`            | Print progress/info to console.                                                          |
 
 To use the sample config:
@@ -215,6 +215,7 @@ python -m heppy.main
 ```
 
 That’s it.
+
 
 
 
