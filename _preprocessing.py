@@ -345,7 +345,14 @@ def preprocess_edf(
         return mne.io.read_raw_fif(output_path, preload=True)
 
     # 1) Read EDF (preload)
-    raw = mne.io.read_raw_edf(input_path, preload=True, verbose=False)
+    if Path(input_path).suffix.lower() == ".bdf":
+        raw = mne.io.read_raw_bdf(input_path, preload=True, verbose=False)
+    elif Path(input_path).suffix.lower() == ".edf":
+        raw = mne.io.read_raw_edf(input_path, preload=True, verbose=False)
+    elif Path(input_path).suffix.lower() == ".fif":
+        raw = mne.io.read_raw_fif(input_path, preload=True, verbose=False)
+    else:
+        raise ValueError(f"Unsupported input format: {input_path}")
 
     # 2) Type auxiliaries early (no n_times change)
     aux_like = ["IBI", "BURSTS", "SUPPR", "T1", "T2", "26", "27", "28", "29", "30"]
