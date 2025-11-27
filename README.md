@@ -19,15 +19,44 @@ Outputs are standard MNE objects on disk plus a summary CSV. Optionally, HEPPy c
 * **QRS QC plots** for rapid screening.
 * **Epoching and amplitude rejection** around R-peaks (configurable).
 * **Error logs per file** with full Python tracebacks.
-* **Optional HRV metrics** (time/frequency/non-linear) with `do_hrv = True`.
+* **Optional HRV metrics** (time/frequency/non-linear) via NeuroKit2.
 * Works with **EDF** or **FIF** inputs; handles typical montages.
 
 ## How to use the GUI (step-by-step)
 The GUI requires an input directory, and supplies defaults for other values.
 A config file can be set up to import new settings - recommended for reproducibilty/convenience.
 
-## Note on AI use for development
-While the mne python code was written by myself, development of the streamlit app was largely AI driven. If you are using the GUI, be aware that there may be some glitches as a result. Let me know if there are any errors that pop up - which should display in the window.
+## Note on AI use for development of GUI
+While the underlying methods were written by myself, development of the streamlit-based app was largely AI driven.
+If you are using the GUI, be aware that there may be some glitches as a result. Let me know if there are any errors that
+pop up - which should display in the window.
+
+## Installation
+HEPPy requires Python 3.8+
+requirements.txt lists the required packages.
+To install, clone this repository and run:
+```bash
+pip install -r requirements.txt
+```
+
+The easiest way to run this is to load your python environment (with the installed requirements) and then run:
+```bash
+streamlit run heppy_gui.py
+```
+
+## Usage
+1. Prepare your EEG data files in a directory (EDF or FIF format) with an ECG channel.
+2. Launch the GUI using the command above.
+3. Select your input directory and configure parameters as needed.
+4. Run the ECG analysis to detect R-peaks and generate QRS plots. (optionally run HRV metrics)
+5. Review the QRS plots and make QC decisions.
+6. Run the HEP extraction using your QC decisions.
+7. Find the outputs in the specified output directory.
+
+## Todo:
+- [ ] Add statistical analysis options
+- [ ] Add some sort of file grouping/handling (?regex etc.)
+
 
 ## Licence
 

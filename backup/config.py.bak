@@ -1,0 +1,22 @@
+# config.py
+"""
+Compatibility shim for configuration loading.
+Previously this module defined HEPConfig and load_from_config_hep directly.
+Now we centralize logic in `_configuration_handler.py` and expose the same
+helper(s) here for backward compatibility while emitting a deprecation
+warning on import.
+"""
+from warnings import warn
+
+warn("Importing `config` is deprecated. Use `_configuration_handler` or `load_config` instead.", DeprecationWarning)
+
+# Support both script execution (absolute import) and package import (relative import)
+try:
+    # when run as a top-level script or simple module, absolute import works
+    from _configuration_handler import load_config, load_from_config_hep, HEPConfig
+except Exception:
+    # when imported as part of a package (e.g., `from package import config`), use relative import
+    from ._configuration_handler import load_config, load_from_config_hep, HEPConfig
+
+__all__ = ["load_config", "load_from_config_hep", "HEPConfig"]
+
