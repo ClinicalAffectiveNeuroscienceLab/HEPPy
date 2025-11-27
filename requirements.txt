@@ -6,4 +6,4 @@ mne~=1.10.0
 mne-icalabel~=0.7.0
 neurokit2~=0.2.12
 torch~=2.8.0
-asrpy>=0.0.8
+streamlit~=1.30.0
