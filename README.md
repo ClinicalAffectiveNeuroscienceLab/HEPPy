@@ -57,6 +57,9 @@ streamlit run heppy_gui.py
 - [ ] Add statistical analysis options
 - [ ] Add some sort of file grouping/handling (?regex etc.)
 
+## Note on usage for initial publication:
+The paper "The heartbeat evoked potential and the prediction of functional seizure semiology" used the code herein to generate the epoched HEP data for the study.
+However, this was done using the script directly, as the GUI had not been built yet. It remains possible to use the code "headless" but you must manually plot and review the epochs for R-peak fit.
 
 ## Licence
 
@@ -67,6 +70,7 @@ MIT. See `LICENSE`.
 ## Citation
 
 If you use HEPPy in a paper or product, please cite:
+
 
 
 
