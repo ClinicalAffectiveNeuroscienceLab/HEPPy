@@ -69,7 +69,13 @@ MIT. See `LICENSE`.
 
 ## Citation
 
-If you use HEPPy in a paper or product, please cite:
+If you use HEPPy in a paper or product, please cite the preprint:
+The heartbeat evoked potential and the prediction of functional seizure semiology
+Rohan Kandasamy, Samia Elkommos, Ineke van Rossum, David Martin-Lopez, Akihiro Koreki, Fiona Farrell, Suzanne O’Sullivan, Beate Diehl, Fahmida Chowdhury, Hugo Critchley, Matthew Walker, Sarah Garfinkel, Mahinda Yogarajah
+medRxiv 2025.07.28.25332134; doi: https://doi.org/10.1101/2025.07.28.25332134
+
+(Please check to see whether this has been updated with the accepted version of the paper)
+
 
 
 
