@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
 pillow
 pandas
 numpy~=2.3.2
