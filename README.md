@@ -1,5 +1,4 @@
 # HEPPy — Heartbeat-Evoked Potential (HEP) extraction for EEG
-## Updated 27-11-2025 - uses streamlit for GUI
 
 HEPPy is a simple, user friendly pipeline for extracting heartbeat-evoked potentials (HEPs) from EEG recordings that include an ECG channel. It provides a **thin GUI** to:
 
@@ -19,6 +18,7 @@ Outputs are standard MNE objects on disk plus a summary CSV. Optionally, HEPPy c
 * **QRS QC plots** for rapid screening.
 * **Epoching and amplitude rejection** around R-peaks (configurable).
 * **Error logs per file** with full Python tracebacks.
+* **Parameter logging** with config files to maximise reproducibility.
 * **Optional HRV metrics** (time/frequency/non-linear) via NeuroKit2.
 * Works with **EDF** or **FIF** inputs; handles typical montages.
 
@@ -54,12 +54,12 @@ streamlit run heppy_gui.py
 7. Find the outputs in the specified output directory.
 
 ## Todo:
-- [ ] Add statistical analysis options
+- [ ] Add statistical analysis options - coming soon! (TFCE/RFT approaches)
 - [ ] Add some sort of file grouping/handling (?regex etc.)
 
 ## Note on usage for initial publication:
 The paper "The heartbeat evoked potential and the prediction of functional seizure semiology" used the code herein to generate the epoched HEP data for the study.
-However, this was done using the script directly, as the GUI had not been built yet. It remains possible to use the code "headless" but you must manually plot and review the epochs for R-peak fit.
+However, this was done using the script directly, as the GUI had not been built yet. It remains possible to use the code "headless" but you must manually plot and review the epochs for R-peak fit. It is recommended that you review all R-peak fitting visually.
 
 ## Licence
 
@@ -69,12 +69,7 @@ MIT. See `LICENSE`.
 
 ## Citation
 
-If you use HEPPy in a paper or product, please cite the preprint:
-The heartbeat evoked potential and the prediction of functional seizure semiology
-Rohan Kandasamy, Samia Elkommos, Ineke van Rossum, David Martin-Lopez, Akihiro Koreki, Fiona Farrell, Suzanne O’Sullivan, Beate Diehl, Fahmida Chowdhury, Hugo Critchley, Matthew Walker, Sarah Garfinkel, Mahinda Yogarajah
-medRxiv 2025.07.28.25332134; doi: https://doi.org/10.1101/2025.07.28.25332134
-
-(Please check to see whether this has been updated with the accepted version of the paper)
+Rohan Kandasamy, Samia Elkommos, Ineke A van Rossum, David Martin-Lopez, Akihiro Koreki, Fiona Farrell, Suzanne O’Sullivan, Beate Diehl, Fahmida A Chowdhury, Hugo Critchley, Matthew C Walker, Sarah Garfinkel, Mahinda Yogarajah, The heartbeat evoked potential and the prediction of functional seizure semiology, Brain Communications, Volume 8, Issue 2, 2026, fcag120, https://doi.org/10.1093/braincomms/fcag120
 
 
 
