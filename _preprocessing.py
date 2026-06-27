@@ -19,14 +19,27 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
-import asrpy
 
 import mne
 import numpy as np
 import neurokit2 as nk
-import pyprep
+import pandas as pd
 from mne.preprocessing import ICA
-from mne_icalabel import label_components
+
+try:
+    import asrpy
+except Exception:  # optional; only required when ASR is enabled
+    asrpy = None
+
+try:
+    import pyprep
+except Exception:  # optional; only required when PyPREP is enabled
+    pyprep = None
+
+try:
+    from mne_icalabel import label_components
+except Exception:  # optional; only required when ICA+ICLabel is enabled
+    label_components = None
 
 # ------------------------- Logging helpers ------------------------- #
 
@@ -41,6 +54,9 @@ _PREPROC_TSV_FIELDS = [
     "remove_cfa", "remove_cfa_mode", "flip_ecg",
     "asr_threshold", "n_comp", "stim_keep",
     "montage_name", "ica_path", "ica_bads", "ica_bad_labels",
+    "spirometry_channel", "spirometry_status", "spirometry_peaks",
+    "spirometry_troughs", "spirometry_qc_png", "spirometry_signals_csv",
+    "spirometry_summary_csv",
     "error_type", "error",
 ]
 
@@ -97,6 +113,8 @@ class _RuntimeCfg:
     line_freqs: tuple | list
     montage_name: str | None = None
     rename_to_1020: bool = True
+    use_ica: bool = True
+    spirometry_channel: str | None = None
 
 _CFG_RT: _RuntimeCfg | None = None
 # fallback defaults in case set_runtime_config is not called
@@ -140,6 +158,8 @@ def set_runtime_config(cfg) -> None:
         line_freqs=getattr(cfg, "line_freqs", (50.0, 100.0)),
         montage_name=getattr(cfg, "montage_name", None),
         rename_to_1020=getattr(cfg, "rename_to_1020", True),
+        use_ica=bool(getattr(cfg, "use_ica", getattr(cfg, "run_ica", True))),
+        spirometry_channel=getattr(cfg, "spirometry_channel", None),
     )
 
     # keep legacy names used in the rest of this module
@@ -171,6 +191,184 @@ def _canonicalise_name(ch: str) -> str:
 AUX_EOG = {'ROC', 'LOC'}
 AUX_STIM = {'PHOTIC'}
 AUX_MISC = {'IBI', 'BURSTS', 'SUPPR'}
+RSP_PEAK_DESC = "RSP_Peak"
+RSP_TROUGH_DESC = "RSP_Trough"
+ECG_TOKENS = ("ECG", "EKG", "CARD")
+
+def _optional_name(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+def _find_channel(raw: mne.io.BaseRaw, preferred: str | None) -> str | None:
+    preferred = _optional_name(preferred)
+    if not preferred:
+        return None
+    if preferred in raw.ch_names:
+        return preferred
+    wanted = preferred.casefold()
+    for ch in raw.ch_names:
+        if ch.casefold() == wanted:
+            return ch
+    canonical = _canonicalise_name(preferred)
+    if canonical in raw.ch_names:
+        return canonical
+    wanted = canonical.casefold()
+    for ch in raw.ch_names:
+        if ch.casefold() == wanted:
+            return ch
+    return None
+
+def _active_spirometry_channel(spirometry_channel: str | None = None) -> str | None:
+    return _optional_name(spirometry_channel) or (_optional_name(_CFG_RT.spirometry_channel) if _CFG_RT else None)
+
+def _mark_spirometry_channel(raw: mne.io.BaseRaw, spirometry_channel: str | None) -> str | None:
+    ch = _find_channel(raw, _active_spirometry_channel(spirometry_channel))
+    if ch:
+        raw.set_channel_types({ch: "resp"})
+    return ch
+
+def _mark_ecg_channels(raw: mne.io.BaseRaw, ecg_channel: str | None = None) -> list[str]:
+    names = []
+    preferred = _find_channel(raw, ecg_channel)
+    if preferred:
+        names.append(preferred)
+    for ch in raw.ch_names:
+        if any(tok in ch.upper() for tok in ECG_TOKENS) and ch not in names:
+            names.append(ch)
+    for ch in names:
+        try:
+            raw.set_channel_types({ch: "ecg"})
+        except Exception:
+            pass
+    return names
+
+def _flip_ecg_channels(raw: mne.io.BaseRaw, ecg_channel: str | None = None) -> list[str]:
+    names = _mark_ecg_channels(raw, ecg_channel)
+    if not names:
+        names = [raw.ch_names[i] for i in mne.pick_types(raw.info, ecg=True)]
+    idx = [raw.ch_names.index(ch) for ch in names if ch in raw.ch_names]
+    if idx:
+        raw._data[idx] *= -1
+    return [raw.ch_names[i] for i in idx]
+
+def _preproc_base_from_output(path: str | Path) -> str:
+    stem = Path(path).stem
+    for suffix in ("_pp_raw_keepcfa", "_pp_raw", "_raw_keepcfa", "_raw"):
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)]
+    return stem
+
+def _has_spirometry_annotations(raw: mne.io.BaseRaw) -> bool:
+    if raw.annotations is None or len(raw.annotations) == 0:
+        return False
+    descriptions = set(np.asarray(raw.annotations.description).astype(str))
+    return bool({RSP_PEAK_DESC, RSP_TROUGH_DESC} & descriptions)
+
+def _add_spirometry_annotations(raw: mne.io.BaseRaw, peaks: np.ndarray, troughs: np.ndarray) -> None:
+    if raw.annotations is not None and len(raw.annotations):
+        old = [i for i, desc in enumerate(raw.annotations.description) if desc in (RSP_PEAK_DESC, RSP_TROUGH_DESC)]
+        if old:
+            annotations = raw.annotations.copy()
+            annotations.delete(old)
+            raw.set_annotations(annotations)
+    samples = np.concatenate([peaks, troughs]).astype(int)
+    if samples.size == 0:
+        return
+    descriptions = [RSP_PEAK_DESC] * len(peaks) + [RSP_TROUGH_DESC] * len(troughs)
+    order = np.argsort(samples)
+    annotations = mne.Annotations(
+        onset=samples[order] / float(raw.info["sfreq"]),
+        duration=np.zeros(samples.size),
+        description=[descriptions[i] for i in order],
+        orig_time=raw.annotations.orig_time,
+    )
+    raw.set_annotations(raw.annotations + annotations)
+
+def save_spirometry_analysis(
+    raw: mne.io.BaseRaw,
+    spirometry_channel: str | None,
+    output_dir: str | Path | None,
+    base: str,
+    redo: bool = False,
+) -> dict:
+    requested = _active_spirometry_channel(spirometry_channel)
+    if not requested:
+        return {"spirometry_status": "off"}
+    ch = _find_channel(raw, requested)
+    if not ch:
+        return {"spirometry_channel": requested, "spirometry_status": "missing"}
+
+    sfreq = float(raw.info["sfreq"])
+    signals, info = nk.rsp_process(raw.get_data(picks=ch)[0], sampling_rate=sfreq)
+    peaks = np.asarray(info.get("RSP_Peaks", []), dtype=int)
+    troughs = np.asarray(info.get("RSP_Troughs", []), dtype=int)
+    _add_spirometry_annotations(raw, peaks, troughs)
+
+    rec = {
+        "spirometry_channel": ch,
+        "spirometry_status": "ok",
+        "spirometry_peaks": str(len(peaks)),
+        "spirometry_troughs": str(len(troughs)),
+    }
+    if output_dir:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        signals_csv = out_dir / f"{base}_rsp_signals.csv"
+        summary_csv = out_dir / f"{base}_rsp_summary.csv"
+        events_csv = out_dir / f"{base}_rsp_events.csv"
+        qc_png = out_dir / f"{base}_rsp_qc.png"
+
+        if redo or not signals_csv.exists():
+            signals.to_csv(signals_csv, index=False)
+        try:
+            summary = nk.rsp_analyze(signals, sampling_rate=sfreq, method="interval-related")
+        except Exception as exc:
+            summary = pd.DataFrame([{"error": str(exc)}])
+        if redo or not summary_csv.exists():
+            summary.to_csv(summary_csv, index=False)
+        if redo or not events_csv.exists():
+            event_rows = (
+                [{"sample": int(s), "time_s": float(s / sfreq), "kind": "peak"} for s in peaks]
+                + [{"sample": int(s), "time_s": float(s / sfreq), "kind": "trough"} for s in troughs]
+            )
+            pd.DataFrame(event_rows, columns=["sample", "time_s", "kind"]).sort_values("sample").to_csv(events_csv, index=False)
+        if redo or not qc_png.exists():
+            import matplotlib.pyplot as plt
+            nk.rsp_plot(signals, info, static=True)
+            fig = plt.gcf()
+            fig.savefig(qc_png, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        rec.update({
+            "spirometry_qc_png": str(qc_png),
+            "spirometry_signals_csv": str(signals_csv),
+            "spirometry_summary_csv": str(summary_csv),
+        })
+    return rec
+
+def spirometry_phase_at_samples(raw: mne.io.BaseRaw, samples: np.ndarray) -> pd.DataFrame | None:
+    if raw.annotations is None or len(raw.annotations) == 0:
+        return None
+    sfreq = float(raw.info["sfreq"])
+    desc = np.asarray(raw.annotations.description).astype(str)
+    ann_samples = np.rint(np.asarray(raw.annotations.onset) * sfreq).astype(int)
+    peaks = ann_samples[desc == RSP_PEAK_DESC]
+    troughs = ann_samples[desc == RSP_TROUGH_DESC]
+    if len(peaks) == 0 or len(troughs) == 0:
+        return None
+    phase = nk.rsp_phase(peaks=peaks, troughs=troughs, desired_length=raw.n_times)
+    idx = np.clip(np.asarray(samples, dtype=int), 0, raw.n_times - 1)
+    rows = phase.iloc[idx].reset_index(drop=True).rename(columns={
+        "RSP_Phase": "resp_phase",
+        "RSP_Phase_Completion": "resp_phase_completion",
+    })
+    vals = pd.to_numeric(rows["resp_phase"], errors="coerce").to_numpy()
+    rows["resp_phase_label"] = np.where(
+        np.isfinite(vals),
+        np.where(vals == 1, "inspiratory", "expiratory"),
+        "unknown",
+    )
+    return rows
 
 def _classify_aux_channels(raw: mne.io.BaseRaw) -> None:
     """Classify obvious auxiliary channels but preserve all EEG leads.
@@ -311,6 +509,8 @@ def run_pyprep(
     ransac: bool = True,
     channel_wise: bool = True,
 ) -> mne.io.BaseRaw:
+    if pyprep is None:
+        raise RuntimeError("PyPREP is enabled but the 'pyprep' package is not installed. Disable 'Run PyPREP' or install pyprep.")
     if param_dict is None:
         param_dict = prep_params
     raw_eeg = raw.copy().pick('eeg')
@@ -379,6 +579,8 @@ def run_asr_ica(
     raw_eeg, _ = mne.set_eeg_reference(raw_eeg, ref_channels='average')
 
     if asr_thresh:
+        if asrpy is None:
+            raise RuntimeError("ASR is enabled but the 'asrpy' package is not installed. Disable 'Run ASR' or install asrpy.")
         asr = asrpy.ASR(sfreq=raw_eeg.info['sfreq'], cutoff=asr_thresh)
         asr.fit(raw_eeg.copy().resample(100))
         raw_eeg = asr.transform(raw_eeg)
@@ -389,6 +591,8 @@ def run_asr_ica(
     ica = ICA(n_components=n_comp, method='infomax', random_state=random_seed, fit_params={"extended": True})
     ica.fit(raw_eeg, decim=3)
 
+    if label_components is None:
+        raise RuntimeError("ICA+ICLabel is enabled but the 'mne_icalabel' package is not installed. Disable 'Run ICA + ICLabel' or install mne-icalabel.")
     iclabel_result = label_components(raw_eeg, ica, method="iclabel")
     labels = iclabel_result.get('labels', [])
     if remove_cfa_flag:
@@ -417,6 +621,26 @@ def run_asr_ica(
         eeg_clean.add_channels([non_eeg], force_update_info=True)
 
     return eeg_clean, ica, bad_label_dict
+
+
+def run_asr_only(
+    raw: mne.io.BaseRaw,
+    asr_thresh: float | int | bool = 20,
+) -> mne.io.BaseRaw:
+    """Apply ASR without ICA/ICLabel, preserving non-EEG channels."""
+    if not asr_thresh:
+        return raw
+    if asrpy is None:
+        raise RuntimeError("ASR is enabled but the 'asrpy' package is not installed. Disable 'Run ASR' or install asrpy.")
+    raw_eeg = raw.copy().pick('eeg')
+    raw_eeg, _ = mne.set_eeg_reference(raw_eeg, ref_channels='average')
+    asr = asrpy.ASR(sfreq=raw_eeg.info['sfreq'], cutoff=asr_thresh)
+    asr.fit(raw_eeg.copy().resample(100))
+    eeg_clean = asr.transform(raw_eeg)
+    non_eeg = raw.copy().pick([ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t != 'eeg'])
+    if len(non_eeg.ch_names):
+        eeg_clean.add_channels([non_eeg], force_update_info=True)
+    return eeg_clean
 
 def detect_r_peaks(raw: mne.io.BaseRaw, stim_channel: str = 'STI 014', gap_threshold_factor: float = 2.0):
     sfreq = raw.info['sfreq']
@@ -453,6 +677,18 @@ def detect_r_peaks(raw: mne.io.BaseRaw, stim_channel: str = 'STI 014', gap_thres
 
 # ------------------------------- Orchestration ---------------------------- #
 
+def _read_raw_any(input_path: str, *, preload=True, verbose=False) -> mne.io.BaseRaw:
+    suffix = Path(input_path).suffix.lower()
+    if suffix == ".bdf":
+        return mne.io.read_raw_bdf(input_path, preload=preload, verbose=verbose)
+    if suffix == ".edf":
+        return mne.io.read_raw_edf(input_path, preload=preload, verbose=verbose)
+    if suffix == ".fif":
+        return mne.io.read_raw_fif(input_path, preload=preload, verbose=verbose)
+    if suffix == ".vhdr":
+        return mne.io.read_raw_brainvision(input_path, preload=preload, verbose=verbose)
+    raise ValueError(f"Unsupported input format: {input_path}")
+
 def preprocess_edf(
     input_path: str,
     output_path: str | None = None,
@@ -464,7 +700,10 @@ def preprocess_edf(
     logging_path: str | None = None,
     remove_cfa_override: bool | None = None,
     flip_ecg: bool = False,
+    ecg_channel: str | None = None,
     stim_keep: list | None = None,
+    spirometry_channel: str | None = None,
+    spirometry_dir: str | Path | None = None,
 ):
     if pyprep_dict is None:
         try:
@@ -503,30 +742,46 @@ def preprocess_edf(
     # idempotency
     if not redo and Path(output_path).exists():
         logging.info(f"Output exists, skipping: {output_path}")
-        return mne.io.read_raw_fif(output_path, preload=True)
+        raw_cached = mne.io.read_raw_fif(output_path, preload=True)
+        had_rsp = _has_spirometry_annotations(raw_cached)
+        spirometry_rec = save_spirometry_analysis(
+            raw_cached,
+            spirometry_channel,
+            spirometry_dir or (Path(output_dir) / "spirometry"),
+            _preproc_base_from_output(output_path),
+            redo=False,
+        )
+        if spirometry_rec.get("spirometry_status") == "ok" and not had_rsp:
+            raw_cached.save(str(output_path), overwrite=True)
+        rec = {
+            "utc": _now_utc_iso(),
+            "status": "OK",
+            "stage": "cached",
+            "input": input_path,
+            "output": str(output_path),
+            "n_channels": len(raw_cached.ch_names),
+            "remove_cfa": str(remove_cfa_override),
+            "remove_cfa_mode": str(getattr(_CFG_RT, "remove_cfa_mode", "")),
+            "flip_ecg": str(bool(flip_ecg)),
+        }
+        rec.update(spirometry_rec)
+        _append_preproc_tsv(logging_path, rec)
+        return raw_cached
 
-    # 1) Read EDF (preload)
-    if Path(input_path).suffix.lower() == ".bdf":
-        raw = mne.io.read_raw_bdf(input_path, preload=True, verbose=False)
-    elif Path(input_path).suffix.lower() == ".edf":
-        raw = mne.io.read_raw_edf(input_path, preload=True, verbose=False)
-    elif Path(input_path).suffix.lower() == ".fif":
-        raw = mne.io.read_raw_fif(input_path, preload=True, verbose=False)
-    else:
-        raise ValueError(f"Unsupported input format: {input_path}")
+    # 1) Read raw input (preload)
+    raw = _read_raw_any(input_path, preload=True, verbose=False)
 
     # 2) Type auxiliaries early (no n_times change)
     aux_like = ["IBI", "BURSTS", "SUPPR", "T1", "T2", "26", "27", "28", "29", "30"]
     present_aux = [ch for ch in aux_like if ch in raw.ch_names]
     if present_aux:
         raw.set_channel_types({ch: "misc" for ch in present_aux})
+    _mark_spirometry_channel(raw, spirometry_channel)
+    _mark_ecg_channels(raw, ecg_channel)
 
     # Optional ECG polarity flip
     if flip_ecg:
-        ecg_idx = mne.pick_types(raw.info, ecg=True)
-        if len(ecg_idx):
-            data = raw.get_data(picks=ecg_idx)
-            raw._data[ecg_idx] = -data
+        _flip_ecg_channels(raw, ecg_channel)
 
     # 3) Global resample once (for identical n_times across all channels)
     if target_sfreq and not np.isclose(raw.info["sfreq"], float(target_sfreq)):
@@ -540,10 +795,7 @@ def preprocess_edf(
             if ch in raw.ch_names:
                 raw.set_channel_types({ch: "stim"})
 
-    # do the same for ECG leads (leads with ecg or ekg in name.lower())
-    for ch in raw.ch_names:
-        if 'ecg' in ch.lower() or 'ekg' in ch.lower():
-            raw.set_channel_types({ch: "ecg"})
+    _mark_ecg_channels(raw, ecg_channel)
 
     raw = standardise_and_montage(raw)
 
@@ -559,26 +811,39 @@ def preprocess_edf(
     if do_pyprep_flag:
         raw = run_pyprep(raw, pyprep_dict, random_seed=random_seed, ransac=bool(_CFG_RT.prep_ransac))
 
-    # 6) ASR + ICA (+/- remove cardiac via ICLabel)
+    # 6) ASR + ICA (+/- remove cardiac via ICLabel), or ASR-only when ICA is disabled
     if remove_cfa_override is None:
         remove_flag = bool(remove_cfa)
     else:
         remove_flag = bool(remove_cfa_override)
-    raw, ica_model, bad_label_dict = run_asr_ica(
-        raw,
-        asr_thresh=asr_threshold,
-        random_seed=random_seed,
-        n_comp=n_comp,
-        remove_cfa_flag=remove_flag,
-    )
+    use_ica_flag = bool(getattr(_CFG_RT, "use_ica", True)) if _CFG_RT is not None else True
+    if use_ica_flag:
+        raw, ica_model, bad_label_dict = run_asr_ica(
+            raw,
+            asr_thresh=asr_threshold,
+            random_seed=random_seed,
+            n_comp=n_comp,
+            remove_cfa_flag=remove_flag,
+        )
+    else:
+        raw = run_asr_only(raw, asr_threshold)
+        ica_model = None
+        bad_label_dict = {}
 
     # 7) ECG → R-peaks → stim events
     raw, events = detect_r_peaks(raw)
+    outp = Path(output_path)
+    spirometry_rec = save_spirometry_analysis(
+        raw,
+        spirometry_channel,
+        spirometry_dir or (Path(output_dir) / "spirometry"),
+        _preproc_base_from_output(outp),
+        redo=redo,
+    )
 
     raw.info["bads"] = []  # clear any stragglers
 
     # 8) Save (guard empty parents)
-    outp = Path(output_path)
     if str(outp.parent) not in ("", "."):
         outp.parent.mkdir(parents=True, exist_ok=True)
     raw.set_meas_date(1)
@@ -611,6 +876,7 @@ def preprocess_edf(
         'ica_bads': ';'.join(str(key) for key in bad_label_dict.keys()),
         'ica_bad_labels': ';'.join(str(val) for val in bad_label_dict.values()),
     }
+    rec.update(spirometry_rec)
     logp = Path(logging_path)
     if str(logp.parent) not in ("", "."):
         logp.parent.mkdir(parents=True, exist_ok=True)
@@ -655,6 +921,8 @@ def _fit_asr_ica_iclabel_once(
 
     # Optional ASR (fit at 100 Hz to reduce cost, consistent with existing code)
     if asr_thresh:
+        if asrpy is None:
+            raise RuntimeError("ASR is enabled but the 'asrpy' package is not installed. Disable 'Run ASR' or install asrpy.")
         asr = asrpy.ASR(sfreq=raw_eeg.info['sfreq'], cutoff=asr_thresh)
         asr.fit(raw_eeg.copy().resample(100))
         raw_eeg = asr.transform(raw_eeg)
@@ -679,6 +947,8 @@ def _fit_asr_ica_iclabel_once(
         # If filtering fails for some reason, proceed (mne_icalabel will likely warn / fail).
         pass
 
+    if label_components is None:
+        raise RuntimeError("ICA+ICLabel is enabled but the 'mne_icalabel' package is not installed. Disable 'Run ICA + ICLabel' or install mne-icalabel.")
     iclabel_result = label_components(inst_for_iclabel, ica, method="iclabel")
     labels = list(iclabel_result.get('labels', []))
 
@@ -719,7 +989,10 @@ def preprocess_edf_both(
     n_comp: int | None = None,
     logging_path: str | None = None,
     flip_ecg: bool = False,
+    ecg_channel: str | None = None,
     stim_keep: list | None = None,
+    spirometry_channel: str | None = None,
+    spirometry_dir: str | Path | None = None,
 ):
     """Preprocess once up to ICA+ICLabel, then write *two* outputs.
 
@@ -735,36 +1008,49 @@ def preprocess_edf_both(
     # Idempotency
     if (not redo) and Path(output_path_remove).exists() and Path(output_path_keep).exists():
         logging.info("Both outputs exist, skipping: %s AND %s", output_path_remove, output_path_keep)
-        return (
-            mne.io.read_raw_fif(output_path_remove, preload=True),
-            mne.io.read_raw_fif(output_path_keep, preload=True),
-        )
+        raw_remove = mne.io.read_raw_fif(output_path_remove, preload=True)
+        raw_keep = mne.io.read_raw_fif(output_path_keep, preload=True)
+        for raw_cached, out_path in ((raw_remove, output_path_remove), (raw_keep, output_path_keep)):
+            had_rsp = _has_spirometry_annotations(raw_cached)
+            spirometry_rec = save_spirometry_analysis(
+                raw_cached,
+                spirometry_channel,
+                spirometry_dir or (Path(output_dir) / "spirometry"),
+                _preproc_base_from_output(out_path),
+                redo=False,
+            )
+            if spirometry_rec.get("spirometry_status") == "ok" and not had_rsp:
+                raw_cached.save(str(out_path), overwrite=True)
+            rec = {
+                "utc": _now_utc_iso(),
+                "status": "OK",
+                "stage": "cached",
+                "input": input_path,
+                "output": str(out_path),
+                "n_channels": len(raw_cached.ch_names),
+                "remove_cfa_mode": "both",
+                "flip_ecg": str(bool(flip_ecg)),
+            }
+            rec.update(spirometry_rec)
+            _append_preproc_tsv(logging_path, rec)
+        return raw_remove, raw_keep
 
     # Shared steps: read, resample, montage, PyPREP
     try:
         # (1) Read
-        suf = Path(input_path).suffix.lower()
-        if suf == ".bdf":
-            raw = mne.io.read_raw_bdf(input_path, preload=True, verbose=False)
-        elif suf == ".edf":
-            raw = mne.io.read_raw_edf(input_path, preload=True, verbose=False)
-        elif suf == ".fif":
-            raw = mne.io.read_raw_fif(input_path, preload=True, verbose=False)
-        else:
-            raise ValueError(f"Unsupported input format: {input_path}")
+        raw = _read_raw_any(input_path, preload=True, verbose=False)
 
         # (2) Re-type obvious aux channels (keep consistent with preprocess_edf)
         aux_like = ["IBI", "BURSTS", "SUPPR", "T1", "T2", "26", "27", "28", "29", "30"]
         present_aux = [ch for ch in aux_like if ch in raw.ch_names]
         if present_aux:
             raw.set_channel_types({ch: "misc" for ch in present_aux})
+        _mark_spirometry_channel(raw, spirometry_channel)
+        _mark_ecg_channels(raw, ecg_channel)
 
         # Flip ECG if requested
         if flip_ecg:
-            ecg_idx = mne.pick_types(raw.info, ecg=True)
-            if len(ecg_idx):
-                data = raw.get_data(picks=ecg_idx)
-                raw._data[ecg_idx] = -data
+            _flip_ecg_channels(raw, ecg_channel)
 
         # (3) Resample
         if target_sfreq and not np.isclose(raw.info["sfreq"], float(target_sfreq)):
@@ -775,12 +1061,7 @@ def preprocess_edf_both(
             for ch in stim_keep:
                 if ch in raw.ch_names:
                     raw.set_channel_types({ch: "stim"})
-        for ch in raw.ch_names:
-            if 'ecg' in ch.lower() or 'ekg' in ch.lower():
-                try:
-                    raw.set_channel_types({ch: "ecg"})
-                except Exception:
-                    pass
+        _mark_ecg_channels(raw, ecg_channel)
 
         # (5) Standardise and apply montage (drops EEG channels not in montage)
         raw = standardise_and_montage(raw)
@@ -825,11 +1106,18 @@ def preprocess_edf_both(
                 eeg_clean.add_channels([non_eeg], force_update_info=True)
             # R-peak events
             eeg_clean, events = detect_r_peaks(eeg_clean)
+            spirometry_rec = save_spirometry_analysis(
+                eeg_clean,
+                spirometry_channel,
+                spirometry_dir or (Path(output_dir) / "spirometry"),
+                _preproc_base_from_output(output_path_remove),
+                redo=redo,
+            )
             eeg_clean.info["bads"] = []
-            return eeg_clean, events, variant_label_dict, ica_local
+            return eeg_clean, events, variant_label_dict, ica_local, spirometry_rec
 
-        raw_remove, events_remove, bad_labels_remove, ica_remove = _apply_and_recombine(bads_remove, bad_map_remove)
-        raw_keep, events_keep, bad_labels_keep, ica_keep = _apply_and_recombine(bads_keep, bad_map_keep)
+        raw_remove, events_remove, bad_labels_remove, ica_remove, spirometry_remove = _apply_and_recombine(bads_remove, bad_map_remove)
+        raw_keep, events_keep, bad_labels_keep, ica_keep, spirometry_keep = _apply_and_recombine(bads_keep, bad_map_keep)
 
         # (8) Save both raws + ICA models
         for outp_str, raw_out, ica_out, bad_labels, events, mode in [
@@ -850,7 +1138,7 @@ def preprocess_edf_both(
             except Exception:
                 ica_path = ""
 
-            _append_preproc_tsv(logging_path, {
+            rec = {
                 "utc": _now_utc_iso(),
                 "status": "OK",
                 "stage": "save",
@@ -869,7 +1157,9 @@ def preprocess_edf_both(
                 "ica_path": ica_path,
                 "ica_bads": ';'.join(str(k) for k in sorted(bad_labels.keys())),
                 "ica_bad_labels": ';'.join(str(bad_labels[k]) for k in sorted(bad_labels.keys())),
-            })
+            }
+            rec.update(spirometry_remove if mode == "remove" else spirometry_keep)
+            _append_preproc_tsv(logging_path, rec)
 
         return raw_remove, raw_keep
 
