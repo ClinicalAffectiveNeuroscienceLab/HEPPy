@@ -41,20 +41,19 @@ pip install -r requirements.txt
 
 The easiest way to run this is to load your python environment (with the installed requirements) and then run:
 ```bash
-streamlit run heppy_gui.py
+streamlit run hep.py
 ```
 
 ## Usage
 1. Prepare your EEG data files in a directory (EDF or FIF format) with an ECG channel.
 2. Launch the GUI using the command above.
 3. Select your input directory and configure parameters as needed.
-4. Run the ECG analysis to detect R-peaks and generate QRS plots. (optionally run HRV metrics)
-5. Review the QRS plots and make QC decisions.
+4. Run the ECG analysis to detect R-peaks and generate QRS plots.
+5. Review the QRS plots and make QC decisions. You can now graphically correct the ECG peaks.
 6. Run the HEP extraction using your QC decisions.
 7. Find the outputs in the specified output directory.
 
 ## Todo:
-- [ ] Add statistical analysis options - coming soon! (TFCE/RFT approaches)
 - [ ] Add some sort of file grouping/handling (?regex etc.)
 
 ## Note on usage for initial publication:
