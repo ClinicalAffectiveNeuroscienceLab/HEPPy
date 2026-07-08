@@ -16,6 +16,7 @@ EEG preprocessing with robust handling of non-10–20 aux channels:
 import os
 import csv
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
@@ -182,8 +183,11 @@ def set_runtime_config(cfg) -> None:
 
 def _canonicalise_name(ch: str) -> str:
     nm = ch.strip()
-    nm = nm.upper().replace('EEG ', '')
-    nm = nm.split('-')[0]
+    nm = re.sub(r'^\s*EEG\s+', '', nm, flags=re.IGNORECASE)
+    parts = [p.strip() for p in nm.split('-') if p.strip()]
+    if len(parts) > 1:
+        nm = parts[1] if parts[0].isdigit() else parts[0]
+    nm = nm.upper()
     nm = nm.replace('FP', 'Fp').replace('Z', 'z')
     repl = {'T7': 'T3', 'T8': 'T4', 'P7': 'T5', 'P8': 'T6'}
     return repl.get(nm, nm)
@@ -193,7 +197,7 @@ AUX_STIM = {'PHOTIC'}
 AUX_MISC = {'IBI', 'BURSTS', 'SUPPR'}
 RSP_PEAK_DESC = "RSP_Peak"
 RSP_TROUGH_DESC = "RSP_Trough"
-ECG_TOKENS = ("ECG", "EKG", "CARD")
+ECG_TOKENS = ("ECG", "EKG", "CARD", "EXG")
 
 def _optional_name(value: str | None) -> str | None:
     text = str(value or "").strip()
@@ -215,6 +219,8 @@ def _find_channel(raw: mne.io.BaseRaw, preferred: str | None) -> str | None:
     wanted = canonical.casefold()
     for ch in raw.ch_names:
         if ch.casefold() == wanted:
+            return ch
+        if _canonicalise_name(ch).casefold() == wanted:
             return ch
     return None
 
@@ -386,7 +392,7 @@ def _classify_aux_channels(raw: mne.io.BaseRaw) -> None:
             raw.set_channel_types({ch: 'stim'})
         elif up in AUX_MISC:
             raw.set_channel_types({ch: 'misc'})
-        elif 'ECG' in up or 'EKG' in up:
+        elif any(tok in up for tok in ECG_TOKENS):
             raw.set_channel_types({ch: 'ecg'})
         elif up == 'EMG':
             raw.set_channel_types({ch: 'emg'})
@@ -402,7 +408,11 @@ def _auto_detect_montage(raw: mne.io.BaseRaw, candidates: list[str] | None = Non
     """Optional montage auto-detection: choose built-in montage with highest channel name coverage."""
     if candidates is None:
         candidates = _DEF_MONTAGES
-    ch_set = set([_canonicalise_name(c) for c in raw.ch_names])
+    ch_set = {
+        _canonicalise_name(ch)
+        for ch, kind in zip(raw.ch_names, raw.get_channel_types())
+        if kind == "eeg" and not any(tok in _canonicalise_name(ch).upper() for tok in ECG_TOKENS)
+    }
     best_name, best_cov = None, 0.0
     for name in candidates:
         try:
@@ -431,7 +441,7 @@ def standardise_and_montage(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
     raw.rename_channels({ch: _canonicalise_name(ch) for ch in raw.ch_names})
     # Decide montage: explicit, auto-detect, or fallback
     m_name = _CFG_RT.montage_name if _CFG_RT else None
-    if m_name is None or str(m_name).lower() in ("", "auto"):
+    if m_name is None or str(m_name).lower() in ("", "auto", "none"):
         detected = _auto_detect_montage(raw)
         m_name = detected or "standard_1020"
     mont = mne.channels.make_standard_montage(m_name)
@@ -568,6 +578,24 @@ def run_pyprep(
 
     return cleaned_eeg
 
+def _max_eeg_time_std(inst: mne.io.BaseRaw) -> float:
+    data = inst.get_data(picks="eeg")
+    return float(np.nanmax(np.nanstd(data, axis=1))) if data.size else 0.0
+
+
+def _apply_ica_excludes(inst: mne.io.BaseRaw, fitted_ica: ICA, exclude: list[int]) -> mne.io.BaseRaw:
+    fitted_ica.exclude = list(exclude)
+    if not fitted_ica.exclude:
+        return inst.copy()
+    before = _max_eeg_time_std(inst)
+    cleaned = fitted_ica.apply(inst.copy())
+    if before and _max_eeg_time_std(cleaned) <= before * 1e-6:
+        logging.warning("ICA application flattened EEG; keeping pre-ICA data.")
+        fitted_ica.exclude = []
+        return inst.copy()
+    return cleaned
+
+
 def run_asr_ica(
     raw: mne.io.BaseRaw,
     asr_thresh: float | int | bool = 20,
@@ -612,8 +640,9 @@ def run_asr_ica(
         except Exception:
             pass
 
-    ica.exclude = bads
-    eeg_clean = ica.apply(raw_eeg)
+    eeg_clean = _apply_ica_excludes(raw_eeg, ica, bads)
+    if not ica.exclude:
+        bad_label_dict = {}
     eeg_clean.interpolate_bads(reset_bads=True)
 
     non_eeg = raw.copy().pick([ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t != 'eeg'])
@@ -1096,8 +1125,9 @@ def preprocess_edf_both(
 
         def _apply_and_recombine(exclude, variant_label_dict):
             ica_local = ica.copy()
-            ica_local.exclude = list(exclude)
-            eeg_clean = ica_local.apply(raw_eeg_proc.copy())
+            eeg_clean = _apply_ica_excludes(raw_eeg_proc, ica_local, list(exclude))
+            if not ica_local.exclude:
+                variant_label_dict = {}
             try:
                 eeg_clean.interpolate_bads(reset_bads=True)
             except Exception:
