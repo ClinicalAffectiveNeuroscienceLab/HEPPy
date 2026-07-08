@@ -196,28 +196,46 @@ def _preprocess_one(
     return outputs
 
 # ----------------- ECG / R-peak detection + adaptive correction ---------
+ECG_TOKENS = ("ECG", "EKG", "CARD", "EXG")
+
+def _canonical_channel_name(ch: str) -> str:
+    name = re.sub(r'^\s*EEG\s+', '', str(ch).strip(), flags=re.IGNORECASE)
+    parts = [p.strip() for p in name.split('-') if p.strip()]
+    if len(parts) > 1:
+        name = parts[1] if parts[0].isdigit() else parts[0]
+    return name.upper().replace("FP", "Fp").replace("Z", "z")
+
+def _same_channel_name(a: str, b: str) -> bool:
+    return str(a).casefold() == str(b).casefold() or _canonical_channel_name(a).casefold() == _canonical_channel_name(b).casefold()
+
+def _ecg_candidates(raw: mne.io.BaseRaw) -> list[str]:
+    names = [raw.ch_names[i] for i in mne.pick_types(raw.info, ecg=True)]
+    for ch in raw.ch_names:
+        if any(tok in ch.upper() for tok in ECG_TOKENS) and ch not in names:
+            names.append(ch)
+    return names
+
 def _auto_pick_ecg(raw: mne.io.BaseRaw, preferred: str|None) -> str:
-    if preferred and preferred in raw.ch_names:
-        return preferred
+    if preferred:
+        for ch in raw.ch_names:
+            if _same_channel_name(ch, preferred):
+                return ch
     idx = mne.pick_types(raw.info, ecg=True)
     if len(idx) > 0:
         return raw.ch_names[idx[0]]
     # try by name
     for name in raw.ch_names:
-        if any(tok in name.upper() for tok in ("ECG", "EKG", "CARD")):
+        if any(tok in name.upper() for tok in ECG_TOKENS):
             return name
     # last resort: strongest single-channel correlation with detected peaks
     raise RuntimeError("No ECG channel found. Please set 'ECG channel' in the sidebar.")
 
 def _mark_ecg_channels(raw: mne.io.BaseRaw, preferred: str | None = None) -> list[str]:
     names = []
-    if preferred and preferred in raw.ch_names:
-        names.append(preferred)
-    elif preferred:
-        wanted = preferred.casefold()
-        names.extend(ch for ch in raw.ch_names if ch.casefold() == wanted)
+    if preferred:
+        names.extend(ch for ch in raw.ch_names if _same_channel_name(ch, preferred))
     for ch in raw.ch_names:
-        if any(tok in ch.upper() for tok in ("ECG", "EKG", "CARD")) and ch not in names:
+        if any(tok in ch.upper() for tok in ECG_TOKENS) and ch not in names:
             names.append(ch)
     for ch in names:
         try:
@@ -287,6 +305,24 @@ def _plot_ecg_panels(signals, info, title="ECG QC"):
     fig = plt.gcf()
     fig.set_size_inches(12, 10)
     fig.suptitle(title)
+    return fig
+
+def _plot_ecg_candidates(raw: mne.io.BaseRaw, candidates: list[str], seconds: float = 12.0):
+    sf = float(raw.info["sfreq"])
+    stop = min(raw.n_times, max(1, int(round(seconds * sf))))
+    t = np.arange(stop) / sf
+    fig, axes = plt.subplots(len(candidates), 1, figsize=(12, max(2.2, 1.8 * len(candidates))), sharex=True)
+    axes = np.atleast_1d(axes)
+    for ax, ch in zip(axes, candidates):
+        y = raw.get_data(picks=ch, start=0, stop=stop)[0].astype(float)
+        y -= np.nanmedian(y)
+        scale = np.nanpercentile(np.abs(y), 95) or 1.0
+        ax.plot(t, y / scale, linewidth=0.8)
+        ax.set_ylabel(ch, rotation=0, ha="right", va="center")
+        ax.grid(True, alpha=0.2)
+    axes[-1].set_xlabel("Seconds")
+    fig.suptitle("ECG lead candidates from first file")
+    fig.tight_layout()
     return fig
 
 def _render_ecg_qc(raw, ecg_name, params):
@@ -639,20 +675,19 @@ def _epoch_from_rpeaks(raw: mne.io.BaseRaw, rpeaks: np.ndarray, tmin: float, tma
 
     event_id = dict(HEP=1)
     metadata = None
-    if spirometry_channel:
-        try:
-            from _preprocessing import spirometry_phase_at_samples
-            metadata = spirometry_phase_at_samples(raw, events[:, 0])
-            if metadata is not None:
-                code_map = {"inspiratory": 1, "expiratory": 2, "unknown": 3}
-                labels = metadata["resp_phase_label"].astype(str).to_numpy()
-                if len(labels):
-                    events[:, 2] = [code_map.get(label, 3) for label in labels]
-                    event_id = {f"HEP/{label}": code for label, code in code_map.items() if label in set(labels)}
-        except Exception:
-            metadata = None
-            event_id = dict(HEP=1)
-            events[:, 2] = 1
+    try:
+        from _preprocessing import spirometry_phase_at_samples
+        metadata = spirometry_phase_at_samples(raw, events[:, 0] - raw.first_samp)
+        if metadata is not None:
+            code_map = {"inspiratory": 1, "expiratory": 2, "unknown": 3}
+            labels = metadata["resp_phase_label"].astype(str).to_numpy()
+            if len(labels):
+                events[:, 2] = [code_map.get(label, 3) for label in labels]
+                event_id = {f"HEP/{label}": code for label, code in code_map.items() if label in set(labels)}
+    except Exception:
+        metadata = None
+        event_id = dict(HEP=1)
+        events[:, 2] = 1
 
     reject = dict(eeg=amp_reject_uv*1e-6) if amp_reject_uv else None
     picks_eeg = mne.pick_types(raw.info, meg=False, eeg=True, eog=False, ecg=False, stim=False)
@@ -831,6 +866,10 @@ with st.sidebar:
             if "nonlinear" in hrv: mapped["hrv_nonlinear"] = bool(hrv.get("nonlinear", False))
 
             ecg_opts = opts_data.get("ecg", {}) or {}
+            if "channel" in ecg_opts:
+                mapped["ecg_channel"] = ecg_opts.get("channel")
+            if "ecg_channel" in opts_data:
+                mapped["ecg_channel"] = opts_data.get("ecg_channel")
             if "flip_on_load" in ecg_opts:
                 mapped["flip_ecg_on_load"] = bool(ecg_opts.get("flip_on_load", False))
             if "flip_ecg_on_load" in opts_data:
@@ -969,6 +1008,42 @@ with cscan1:
 with cscan2:
     st.write(f"Current selection: {len(st.session_state.get('raw_files', []))} file(s)")
 
+ecg_channel = ecg_channel or st.session_state.get("selected_ecg_channel")
+files_for_ecg_pick = st.session_state.get("raw_files", [])
+if files_for_ecg_pick and not ecg_channel:
+    with st.expander("ECG lead picker", expanded=True):
+        raw_pick = None
+        try:
+            raw_pick = _load_raw_minimal_for_ecg(Path(files_for_ecg_pick[0]), None, flip_ecg=flip_ecg_on_load)
+            candidates = _ecg_candidates(raw_pick)
+            if not candidates:
+                st.warning("No ECG-like leads found in the first file. Set ECG channel manually.")
+            elif len(candidates) == 1:
+                ecg_channel = candidates[0]
+                st.session_state["selected_ecg_channel"] = ecg_channel
+                st.session_state.setdefault("runtime_config", {})["ecg_channel"] = ecg_channel
+                st.caption(f"Using ECG lead: {ecg_channel}")
+            else:
+                chosen = st.selectbox(
+                    "Choose ECG lead for this batch",
+                    candidates,
+                    key="ecg_channel_picker",
+                )
+                ecg_channel = chosen
+                st.session_state["selected_ecg_channel"] = chosen
+                st.session_state.setdefault("runtime_config", {})["ecg_channel"] = chosen
+                fig = _plot_ecg_candidates(raw_pick, candidates)
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+        except Exception as e:
+            st.warning(f"Could not preview ECG lead candidates: {e}")
+        finally:
+            try:
+                if raw_pick is not None:
+                    raw_pick.close()
+            except Exception:
+                pass
+
 # --------- Step 1: ECG detection & QC (do this first) ---------
 st.header("1) ECG R-peak detection + QC (first)")
 col_ecg1, col_ecg2 = st.columns([1,1], gap="large")
@@ -1018,9 +1093,11 @@ else:
 
     idx_options = [f"{i:03d} | {row.base}" for i, row in df_review.iterrows()]
     if "force_sel_next" in st.session_state:
-        default_sel = int(st.session_state.pop("force_sel_next"))
+        default_sel = max(0, min(int(st.session_state.pop("force_sel_next")), len(df_review) - 1))
+        st.session_state["sel_key"] = default_sel
     else:
         default_sel = int(st.session_state.get("sel_key", 0)) if str(st.session_state.get("sel_key","")).isdigit() else 0
+        default_sel = max(0, min(default_sel, len(df_review) - 1))
     cur_ix = st.selectbox(
         "Choose item",
         options=list(range(len(df_review))),
@@ -1186,7 +1263,7 @@ else:
         if st.button("Next unassessed ➡️"):
             empties = df_review.index[df_review["viable"].fillna("").astype(str).str.len()==0].tolist()
             if len(empties)>0:
-                next_ix = int(empties[0])
+                next_ix = int(next((ix for ix in empties if ix > cur_ix), empties[0]))
                 try:
                     st.query_params["sel"] = str(next_ix)
                 except Exception:
