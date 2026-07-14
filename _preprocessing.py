@@ -15,6 +15,8 @@ EEG preprocessing with robust handling of non-10–20 aux channels:
 
 import os
 import csv
+import gc
+import inspect
 import logging
 import re
 from datetime import datetime
@@ -28,6 +30,11 @@ import pandas as pd
 from mne.preprocessing import ICA
 
 try:
+    import psutil
+except Exception:  # optional; used only for native-memory breadcrumbs
+    psutil = None
+
+try:
     import asrpy
 except Exception:  # optional; only required when ASR is enabled
     asrpy = None
@@ -37,15 +44,37 @@ try:
 except Exception:  # optional; only required when PyPREP is enabled
     pyprep = None
 
+_PYPREP_SAFE_QUANTILE_PATCHED = False
+
 try:
     from mne_icalabel import label_components
 except Exception:  # optional; only required when ICA+ICLabel is enabled
     label_components = None
 
+try:
+    from mne_icalabel.iclabel import iclabel_label_components
+except Exception:  # older mne-icalabel versions do not expose backend selection
+    iclabel_label_components = None
+
 # ------------------------- Logging helpers ------------------------- #
 
 def _now_utc_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _stage(name: str) -> None:
+    # The parent process records stdout.  This breadcrumb survives ordinary
+    # exceptions and identifies the native call active immediately before a
+    # Windows access violation.  RSS is more useful than tracemalloc here
+    # because NumPy, BLAS, ONNX and PyTorch allocate outside Python's heap.
+    rss = ""
+    if psutil is not None:
+        try:
+            rss = f"\trss_gib={psutil.Process().memory_info().rss / 2**30:.3f}"
+        except Exception:
+            pass
+    print(f"HEPPY_STAGE\t{name}{rss}", flush=True)
+    logging.info("HEPPY stage: %s%s", name, rss)
 
 # Fixed TSV schema so all runs (success/fail) align.
 _PREPROC_TSV_FIELDS = [
@@ -116,6 +145,12 @@ class _RuntimeCfg:
     rename_to_1020: bool = True
     use_ica: bool = True
     spirometry_channel: str | None = None
+    pyprep_channel_wise: bool = False
+    pyprep_max_chunk_size: int | None = 8
+    pyprep_by_segment: bool = False
+    pyprep_safe_quantile_patch: bool = False
+    ica_fit_hz: float = 100.0
+    iclabel_backend: str | None = "auto"
 
 _CFG_RT: _RuntimeCfg | None = None
 # fallback defaults in case set_runtime_config is not called
@@ -130,7 +165,7 @@ prep_params = {
 
 def set_runtime_config(cfg) -> None:
     """Call this once from the CLI or notebook to bind the active config."""
-    global _CFG_RT, output_dir, target_sfreq, do_asr, remove_cfa, remove_cfa_mode, log_file, prep_params
+    global _CFG_RT, output_dir, target_sfreq, do_asr, do_pyprep, remove_cfa, remove_cfa_mode, log_file, prep_params
     # derive ICA cardiac strategy
     mode = getattr(cfg, "remove_cfa_mode", None)
     legacy_flag = getattr(cfg, "remove_cfa", None)
@@ -161,6 +196,12 @@ def set_runtime_config(cfg) -> None:
         rename_to_1020=getattr(cfg, "rename_to_1020", True),
         use_ica=bool(getattr(cfg, "use_ica", getattr(cfg, "run_ica", True))),
         spirometry_channel=getattr(cfg, "spirometry_channel", None),
+        pyprep_channel_wise=bool(getattr(cfg, "pyprep_channel_wise", False)),
+        pyprep_max_chunk_size=getattr(cfg, "pyprep_max_chunk_size", 8),
+        pyprep_by_segment=bool(getattr(cfg, "pyprep_by_segment", False)),
+        pyprep_safe_quantile_patch=bool(getattr(cfg, "pyprep_safe_quantile_patch", False)),
+        ica_fit_hz=float(getattr(cfg, "ica_fit_hz", 100.0)),
+        iclabel_backend=getattr(cfg, "iclabel_backend", "auto"),
     )
 
     # keep legacy names used in the rest of this module
@@ -192,8 +233,20 @@ def _canonicalise_name(ch: str) -> str:
     repl = {'T7': 'T3', 'T8': 'T4', 'P7': 'T5', 'P8': 'T6'}
     return repl.get(nm, nm)
 
+def _canonical_name_mapping(ch_names: list[str]) -> dict[str, str]:
+    mapping, used, counts = {}, set(), {}
+    for ch in ch_names:
+        base = _canonicalise_name(ch)
+        name = base
+        while name in used:
+            counts[base] = counts.get(base, 0) + 1
+            name = f"{base}-{counts[base]}"
+        mapping[ch] = name
+        used.add(name)
+    return mapping
+
 AUX_EOG = {'ROC', 'LOC'}
-AUX_STIM = {'PHOTIC'}
+AUX_STIM = {'PHOTIC', 'MKR', 'MKR+', 'MARKER'}
 AUX_MISC = {'IBI', 'BURSTS', 'SUPPR'}
 RSP_PEAK_DESC = "RSP_Peak"
 RSP_TROUGH_DESC = "RSP_Trough"
@@ -438,7 +491,7 @@ def standardise_and_montage(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
     when dense arrays are used. All EEG channels are preserved.
     """
     # Canonicalise channel names first to maximize montage matching
-    raw.rename_channels({ch: _canonicalise_name(ch) for ch in raw.ch_names})
+    raw.rename_channels(_canonical_name_mapping(raw.ch_names))
     # Decide montage: explicit, auto-detect, or fallback
     m_name = _CFG_RT.montage_name if _CFG_RT else None
     if m_name is None or str(m_name).lower() in ("", "auto", "none"):
@@ -457,7 +510,10 @@ def standardise_and_montage(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
     # Drop EEG channels not present in montage (post-application)
     mont_chs = set(mont.ch_names)
     drop_eeg = [ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t == "eeg" and ch not in mont_chs]
-    if drop_eeg:
+    eeg_chs = [ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t == "eeg"]
+    if drop_eeg and len(drop_eeg) == len(eeg_chs):
+        logging.warning("No EEG channels matched montage %s; preserving unmatched EEG names.", m_name)
+    elif drop_eeg:
         raw.drop_channels(drop_eeg)
 
     # force the lead name types to be str (to avoid issues with numpy.str_)
@@ -510,6 +566,123 @@ def _prune_prep_params_for_raw(params: dict, raw: mne.io.BaseRaw) -> dict:
         return d
     return _walk(pruned)
 
+def _add_channels_by_name(
+    target: mne.io.BaseRaw,
+    source: mne.io.BaseRaw,
+    channel_names: list[str],
+) -> mne.io.BaseRaw:
+    channel_names = [ch for ch in channel_names if ch in source.ch_names and ch not in target.ch_names]
+    if not channel_names:
+        return target
+    picks = mne.pick_channels(source.ch_names, include=channel_names, ordered=True)
+    data = source.get_data(picks=picks)
+    info = mne.pick_info(source.info, picks, copy=True)
+    selected = mne.io.RawArray(
+        data,
+        info,
+        first_samp=source.first_samp,
+        copy="auto",
+        verbose=False,
+    )
+    target.add_channels([selected], force_update_info=True)
+    return target
+
+
+def _add_non_eeg_channels(target: mne.io.BaseRaw, source: mne.io.BaseRaw) -> mne.io.BaseRaw:
+    non_eeg_chs = [
+        ch for ch, kind in zip(source.ch_names, source.get_channel_types()) if kind != "eeg"
+    ]
+    return _add_channels_by_name(target, source, non_eeg_chs)
+
+def _snip_sample_bounds_for_input(input_path: str, raw: mne.io.BaseRaw) -> list[tuple[int, int]] | None:
+    manifest = Path(input_path).with_name("snip_keyfile.csv")
+    if not manifest.exists():
+        return None
+    sfreq = float(raw.info["sfreq"])
+    target = Path(input_path).name
+    bounds: list[tuple[int, int]] = []
+    with manifest.open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if Path(str(row.get("output_edf", ""))).name != target:
+                continue
+            try:
+                start = float(row["output_start_seconds"])
+                end = float(row["output_end_seconds"])
+            except Exception:
+                continue
+            if not (np.isfinite(start) and np.isfinite(end) and end > start):
+                continue
+            start_samp = max(0, min(raw.n_times, int(round(start * sfreq))))
+            end_samp = max(0, min(raw.n_times, int(round(end * sfreq))))
+            if end_samp > start_samp:
+                bounds.append((start_samp, end_samp))
+    if len(bounds) <= 1:
+        return None
+    bounds.sort()
+    tol = max(2, int(round(0.01 * sfreq)))
+    expected = 0
+    for start, stop in bounds:
+        if abs(start - expected) > tol:
+            logging.warning("Snip manifest for %s has a gap/overlap near sample %s; using whole-record PyPREP.", target, expected)
+            return None
+        expected = stop
+    if abs(expected - raw.n_times) > tol:
+        logging.warning("Snip manifest for %s covers %s/%s samples; using whole-record PyPREP.", target, expected, raw.n_times)
+        return None
+    return bounds
+
+def _safe_mat_quantile_1d(values, q: float) -> float:
+    vals = np.asarray(values, dtype=float).ravel()
+    vals = vals[np.isfinite(vals)]
+    n = vals.size
+    if n == 0:
+        return float("nan")
+    if n == 1:
+        return float(vals[0])
+    q_adj = ((float(q) - 0.5) * n / (n - 1)) + 0.5
+    exact_idx = (n - 1) * np.clip(q_adj, 0, 1)
+    pre_idx = int(np.floor(exact_idx))
+    post_idx = int(np.ceil(exact_idx))
+    vals.partition((pre_idx, post_idx))
+    pre = vals[pre_idx]
+    post = vals[post_idx]
+    return float(pre + (post - pre) * (exact_idx - pre_idx))
+
+def _safe_mat_quantile(arr, q, axis=None):
+    data = np.asarray(arr)
+    if data.size == 0:
+        return np.nan
+    if data.ndim > 2:
+        raise ValueError(f"Only 1D and 2D arrays are supported (input has {data.ndim} dimensions)")
+    if axis is None or data.ndim == 1:
+        return _safe_mat_quantile_1d(data, q)
+    if axis < 0:
+        axis += data.ndim
+    if axis == 0:
+        return np.asarray([_safe_mat_quantile_1d(data[:, idx], q) for idx in range(data.shape[1])])
+    if axis == 1:
+        return np.asarray([_safe_mat_quantile_1d(data[idx, :], q) for idx in range(data.shape[0])])
+    raise ValueError(f"axis {axis} is out of bounds for array of dimension {data.ndim}")
+
+def _safe_mat_iqr(arr, axis=None):
+    return _safe_mat_quantile(arr, 0.75, axis) - _safe_mat_quantile(arr, 0.25, axis)
+
+def _install_pyprep_safe_quantile_patch() -> None:
+    global _PYPREP_SAFE_QUANTILE_PATCHED
+    if _PYPREP_SAFE_QUANTILE_PATCHED or pyprep is None:
+        return
+    try:
+        import pyprep.find_noisy_channels as noisy_channels
+        import pyprep.utils as utils
+    except Exception:
+        return
+    utils._mat_quantile = _safe_mat_quantile
+    utils._mat_iqr = _safe_mat_iqr
+    noisy_channels._mat_quantile = _safe_mat_quantile
+    noisy_channels._mat_iqr = _safe_mat_iqr
+    _PYPREP_SAFE_QUANTILE_PATCHED = True
+    logging.info("Patched PyPREP quantile helper for bounded-memory channel IQR.")
+
 # ------------------------------- Core steps -------------------------------- #
 
 def run_pyprep(
@@ -517,78 +690,348 @@ def run_pyprep(
     param_dict: dict | None = None,
     random_seed: int = 42,
     ransac: bool = True,
-    channel_wise: bool = True,
+    channel_wise: bool | None = None,
+    max_chunk_size: int | None = None,
+    segment_bounds: list[tuple[int, int]] | None = None,
 ) -> mne.io.BaseRaw:
     if pyprep is None:
-        raise RuntimeError("PyPREP is enabled but the 'pyprep' package is not installed. Disable 'Run PyPREP' or install pyprep.")
+        raise RuntimeError(
+            "PyPREP is enabled but the 'pyprep' package is not installed. "
+            "Disable 'Run PyPREP' or install pyprep."
+        )
+    if _CFG_RT is not None and _CFG_RT.pyprep_safe_quantile_patch:
+        _install_pyprep_safe_quantile_patch()
     if param_dict is None:
         param_dict = prep_params
-    raw_eeg = raw.copy().pick('eeg')
+    if channel_wise is None:
+        channel_wise = bool(getattr(_CFG_RT, "pyprep_channel_wise", False))
+    if max_chunk_size is None and _CFG_RT is not None:
+        max_chunk_size = _CFG_RT.pyprep_max_chunk_size
+
+    # Segment-wise PyPREP is retained as an opt-in compatibility mode.  It is
+    # substantially slower and keeps several complete Raw objects alive, so the
+    # stable default is one fit over the patient recording.
+    if segment_bounds and len(segment_bounds) > 1:
+        sfreq = float(raw.info["sfreq"])
+        chunks = []
+        logging.info("Running PyPREP over %d snip segments.", len(segment_bounds))
+        for idx, (start, stop) in enumerate(segment_bounds, start=1):
+            start = max(0, min(raw.n_times, int(start)))
+            stop = max(0, min(raw.n_times, int(stop)))
+            if stop <= start:
+                continue
+            chunk = raw.copy().crop(
+                tmin=start / sfreq,
+                tmax=(stop - 1) / sfreq,
+                include_tmax=True,
+            )
+            try:
+                chunks.append(
+                    run_pyprep(
+                        chunk,
+                        param_dict,
+                        random_seed=random_seed + idx,
+                        ransac=ransac,
+                        channel_wise=channel_wise,
+                        max_chunk_size=max_chunk_size,
+                        segment_bounds=None,
+                    )
+                )
+            except Exception as exc:
+                logging.warning(
+                    "PyPREP failed on segment %d/%d (%d:%d); keeping raw segment: %s",
+                    idx,
+                    len(segment_bounds),
+                    start,
+                    stop,
+                    exc,
+                )
+                chunks.append(chunk)
+        if chunks:
+            return mne.concatenate_raws(chunks, verbose=False)
+
+    raw_eeg = raw.copy().pick("eeg")
     safe_params = _prune_prep_params_for_raw(param_dict, raw_eeg)
     trimmed_mont = _trim_eeg_montage_no_nan(raw_eeg)
+    if trimmed_mont is None:
+        logging.warning("PyPREP skipped; no EEG channels have usable montage positions.")
+        _add_non_eeg_channels(raw_eeg, raw)
+        return raw_eeg
 
-    # Ensure keys PyPREP expects are present to avoid KeyError
     safe_params.setdefault("line_freqs", ())
     safe_params.setdefault("l_freq", None)
     safe_params.setdefault("h_freq", None)
-
-    prep = pyprep.PrepPipeline(
-        raw=raw_eeg, montage=trimmed_mont, prep_params=safe_params,
-        random_state=random_seed, ransac=ransac, channel_wise=channel_wise,
+    nyquist = float(raw_eeg.info["sfreq"]) / 2.0
+    safe_params["line_freqs"] = tuple(
+        float(freq)
+        for freq in safe_params.get("line_freqs", ())
+        if 0.0 < float(freq) < nyquist
     )
+
+    def _fit_prep(use_ransac: bool):
+        kwargs = {
+            "raw": raw_eeg,
+            "montage": trimmed_mont,
+            "prep_params": safe_params,
+            "random_state": random_seed,
+            "ransac": use_ransac,
+            "channel_wise": bool(channel_wise),
+        }
+        try:
+            parameters = inspect.signature(pyprep.PrepPipeline).parameters
+        except Exception:
+            parameters = {}
+        if "max_chunk_size" in parameters:
+            kwargs["max_chunk_size"] = max_chunk_size
+        if "reject_by_annotation" in parameters:
+            kwargs["reject_by_annotation"] = "omit"
+        prep = pyprep.PrepPipeline(**kwargs)
+        _stage(
+            f"pyprep_fit:r={int(use_ransac)}:channel_wise={int(bool(channel_wise))}"
+        )
+        with open(os.devnull, "w") as fnull, redirect_stdout(fnull), redirect_stderr(fnull):
+            return prep.fit()
+
+    result = None
     try:
-        with open(os.devnull, 'w') as fnull, redirect_stdout(fnull), redirect_stderr(fnull):
-            result = prep.fit()
-    except Exception as e:
-        print("→ EEG picks:", sorted(raw_eeg.ch_names))
-        if trimmed_mont is not None:
-            print("→ trimmed EEG montage ch_pos:",
-                  sorted((_finite_ch_pos(trimmed_mont.get_positions().get('ch_pos', {}))).keys()))
-        print("→ params (ref/reref/eog/ransac/interp/corr):",
-              {k: safe_params.get(k) for k in ("ref_chs","reref_chs","eog_chs",
-                                               "ransac_channel_picks","interpolation_channel_picks","corr_chs")})
-        raise RuntimeError(f"PyPREP failed: {e}") from e
+        result = _fit_prep(ransac)
+    except Exception as exc:
+        failure = exc
+        msg = str(failure)
+        ransac_exhausted = ransac and (
+            "Too few channels in the original data to reliably perform RANSAC" in msg
+            or "Too many noisy channels in the data to reliably perform RANSAC" in msg
+            or "arrays used as indices must be of integer (or boolean) type" in msg
+        )
+        if ransac_exhausted:
+            logging.warning("PyPREP RANSAC skipped after failure: %s", failure)
+            try:
+                result = _fit_prep(False)
+            except Exception as fallback_exc:
+                failure = fallback_exc
+            else:
+                failure = None
+        if failure is not None and "RobustReference:TooManyBad" in str(failure):
+            logging.warning(
+                "PyPREP skipped; too many bad EEG channels for robust reference: %s",
+                failure,
+            )
+            failure = None
+        if failure is not None:
+            print("EEG picks:", sorted(raw_eeg.ch_names))
+            print(
+                "trimmed EEG montage ch_pos:",
+                sorted(
+                    _finite_ch_pos(
+                        trimmed_mont.get_positions().get("ch_pos", {})
+                    ).keys()
+                ),
+            )
+            print(
+                "params (ref/reref/eog/ransac/interp/corr):",
+                {
+                    key: safe_params.get(key)
+                    for key in (
+                        "ref_chs",
+                        "reref_chs",
+                        "eog_chs",
+                        "ransac_channel_picks",
+                        "interpolation_channel_picks",
+                        "corr_chs",
+                    )
+                },
+            )
+            raise RuntimeError(f"PyPREP failed: {failure}") from failure
 
-    cleaned_eeg = result.raw_eeg
-    try:
-        cleaned_eeg.interpolate_bads(reset_bads=False)
-    except Exception:
-        raise RuntimeError("PyPREP bad channel interpolation failed.")
-    
-    cleaned_eeg.info['bads'] = []
-
-    l_freq = safe_params.get('l_freq', None)
-    h_freq = safe_params.get('h_freq', None)
-
-    # if the raw is already filtered with h_freq = h_freq, skip filtering
-    if h_freq is not None and raw_eeg.info.get('highpass', None) is not None:
-        if np.isclose(raw_eeg.info['highpass'], float(h_freq)):
-            h_freq = None
-    # if the raw is already filtered with l_freq = l_freq, skip filtering
-    if l_freq is not None and raw_eeg.info.get('lowpass', None) is not None:
-        if np.isclose(raw_eeg.info['lowpass'], float(l_freq)):
-            l_freq = None
-
-    if l_freq is not None or h_freq is not None:
-        cleaned_eeg.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin')
-
-    non_eeg = raw.copy().pick([ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t != 'eeg'])
-    if len(non_eeg.ch_names):
-        cleaned_eeg.add_channels([non_eeg], force_update_info=True)
-
+    cleaned_eeg = result.raw_eeg if result is not None else raw_eeg
+    if cleaned_eeg.info.get("bads"):
+        try:
+            cleaned_eeg.interpolate_bads(reset_bads=True)
+        except Exception as exc:
+            raise RuntimeError("PyPREP bad channel interpolation failed.") from exc
+    cleaned_eeg.info["bads"] = []
+    _add_non_eeg_channels(cleaned_eeg, raw)
     return cleaned_eeg
 
+
+def _effective_filter_bounds(
+    raw: mne.io.BaseRaw,
+    l_freq: float | None,
+    h_freq: float | None,
+) -> tuple[float | None, float | None]:
+    nyquist = float(raw.info["sfreq"]) / 2.0
+    low = float(l_freq) if l_freq is not None else None
+    high = float(h_freq) if h_freq is not None else None
+    if low is not None and low <= 0:
+        low = None
+    if high is not None and high >= nyquist:
+        # Sampling already imposes this upper bound; asking MNE to design a
+        # filter exactly at Nyquist is invalid.
+        high = None
+    if low is not None and low >= nyquist:
+        raise ValueError(f"High-pass {low} Hz is not below Nyquist {nyquist} Hz")
+    if low is not None and high is not None and low >= high:
+        raise ValueError(f"Invalid EEG band-pass: {low}–{high} Hz")
+    return low, high
+
+
+def _filter_eeg_once(
+    raw: mne.io.BaseRaw,
+    l_freq: float | None,
+    h_freq: float | None,
+) -> mne.io.BaseRaw:
+    low, high = _effective_filter_bounds(raw, l_freq, h_freq)
+
+    # MNE records the effective high- and low-pass limits in info.  The old
+    # implementation compared these fields to the wrong requested cut-offs,
+    # so already-filtered data were filtered again.
+    existing_low = float(raw.info.get("highpass", 0.0) or 0.0)
+    existing_high = float(raw.info.get("lowpass", np.inf) or np.inf)
+    tolerance = 1e-6
+    if low is not None and existing_low >= low - tolerance:
+        if existing_low > low + tolerance:
+            logging.warning(
+                "Input is already high-passed at %.3f Hz, above requested %.3f Hz; "
+                "the removed lower frequencies cannot be restored.",
+                existing_low,
+                low,
+            )
+        low = None
+    if high is not None and existing_high <= high + tolerance:
+        if existing_high < high - tolerance:
+            logging.warning(
+                "Input is already low-passed at %.3f Hz, below requested %.3f Hz; "
+                "the removed higher frequencies cannot be restored.",
+                existing_high,
+                high,
+            )
+        high = None
+
+    if low is None and high is None:
+        return raw
+    _stage(f"eeg_filter:{low}:{high}")
+    raw.filter(
+        l_freq=low,
+        h_freq=high,
+        picks="eeg",
+        fir_design="firwin",
+        n_jobs=1,
+        verbose=False,
+    )
+    return raw
+
+
+def _normalise_asr_cutoff(value) -> float | None:
+    if value is None or value is False:
+        return None
+    if value is True:
+        return 20.0
+    try:
+        cutoff = float(value)
+    except (TypeError, ValueError):
+        return None
+    return cutoff if cutoff > 0 else None
+
+
+def _ica_decimation(raw: mne.io.BaseRaw) -> int:
+    target_hz = float(getattr(_CFG_RT, "ica_fit_hz", 100.0) or 100.0)
+    return max(1, int(np.ceil(float(raw.info["sfreq"]) / target_hz)))
+
+
+_ICLABEL_CLASSES = (
+    "brain",
+    "muscle artifact",
+    "eye blink",
+    "heart beat",
+    "line noise",
+    "channel noise",
+    "other",
+)
+
+
+def _normalise_iclabel_label(label: str) -> str:
+    text = str(label).strip().lower().replace("_", " ")
+    aliases = {
+        "heart": "heart beat",
+        "cardiac": "heart beat",
+        "eye": "eye blink",
+        "muscle": "muscle artifact",
+    }
+    return aliases.get(text, text)
+
+
+def _label_ica_components(inst: mne.io.BaseRaw, ica: ICA) -> list[str]:
+    backend = str(getattr(_CFG_RT, "iclabel_backend", "auto") or "").strip().lower()
+    if backend in {"", "auto", "none"}:
+        backend = ""
+
+    if backend and iclabel_label_components is not None:
+        _stage(f"iclabel:{backend}")
+        try:
+            probabilities = iclabel_label_components(
+                inst, ica, inplace=True, backend=backend
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"ICLabel backend {backend!r} failed. Install a compatible "
+                f"backend or set preprocessing_tuning.iclabel_backend: {exc}"
+            ) from exc
+        probabilities = np.asarray(probabilities)
+        if probabilities.ndim != 2 or probabilities.shape[1] != len(_ICLABEL_CLASSES):
+            raise RuntimeError(
+                f"Unexpected ICLabel probability shape: {probabilities.shape}"
+            )
+        return [
+            _ICLABEL_CLASSES[int(index)]
+            for index in np.argmax(probabilities, axis=1)
+        ]
+
+    if label_components is None:
+        raise RuntimeError(
+            "ICA+ICLabel is enabled but the 'mne_icalabel' package is not installed. "
+            "Disable 'Run ICA + ICLabel' or install mne-icalabel."
+        )
+    _stage("iclabel:auto")
+    result = label_components(inst, ica, method="iclabel")
+    labels = [_normalise_iclabel_label(value) for value in result.get("labels", [])]
+    if not labels:
+        raise RuntimeError("ICLabel returned no component labels")
+    return labels
+
+
+def _iclabel_instance(raw_eeg: mne.io.BaseRaw) -> mne.io.BaseRaw:
+    highpass = float(raw_eeg.info.get("highpass", 0.0) or 0.0)
+    lowpass = float(raw_eeg.info.get("lowpass", np.inf) or np.inf)
+    required_high = min(100.0, np.nextafter(float(raw_eeg.info["sfreq"]) / 2.0, 0.0))
+    if highpass >= 0.95 and lowpass <= required_high + 0.5:
+        return raw_eeg
+    inst = raw_eeg.copy()
+    return _filter_eeg_once(inst, 1.0, required_high)
+
+
 def _max_eeg_time_std(inst: mne.io.BaseRaw) -> float:
-    data = inst.get_data(picks="eeg")
-    return float(np.nanmax(np.nanstd(data, axis=1))) if data.size else 0.0
+    picks = mne.pick_types(inst.info, eeg=True, exclude=[])
+    maximum = 0.0
+    for pick in picks:
+        if inst.preload:
+            values = inst._data[pick]
+        else:
+            values = inst.get_data(picks=[pick])[0]
+        maximum = max(maximum, float(np.nanstd(values)))
+    return maximum
 
 
-def _apply_ica_excludes(inst: mne.io.BaseRaw, fitted_ica: ICA, exclude: list[int]) -> mne.io.BaseRaw:
+def _apply_ica_excludes(
+    inst: mne.io.BaseRaw,
+    fitted_ica: ICA,
+    exclude: list[int],
+) -> mne.io.BaseRaw:
     fitted_ica.exclude = list(exclude)
     if not fitted_ica.exclude:
         return inst.copy()
     before = _max_eeg_time_std(inst)
-    cleaned = fitted_ica.apply(inst.copy())
+    _stage(f"ica_apply:n_exclude={len(fitted_ica.exclude)}")
+    cleaned = fitted_ica.apply(inst.copy(), verbose=False)
     if before and _max_eeg_time_std(cleaned) <= before * 1e-6:
         logging.warning("ICA application flattened EEG; keeping pre-ICA data.")
         fitted_ica.exclude = []
@@ -596,115 +1039,187 @@ def _apply_ica_excludes(inst: mne.io.BaseRaw, fitted_ica: ICA, exclude: list[int
     return cleaned
 
 
+def _apply_asr(
+    raw_eeg: mne.io.BaseRaw,
+    asr_thresh: float | int | bool | None,
+) -> mne.io.BaseRaw:
+    cutoff = _normalise_asr_cutoff(asr_thresh)
+    if cutoff is None:
+        return raw_eeg
+    if asrpy is None:
+        raise RuntimeError(
+            "ASR is enabled but the 'asrpy' package is not installed. "
+            "Disable 'Run ASR' or install asrpy."
+        )
+    # ASRpy binds the model to the sampling rate supplied at construction.
+    # Fitting at 100 Hz and then transforming a higher-rate Raw is not a valid
+    # speed shortcut and can fail inside NumPy/BLAS code.  Keep fit and
+    # transform at exactly the same sampling rate.
+    sfreq = float(raw_eeg.info["sfreq"])
+    _stage(f"asr_fit:cutoff={cutoff}:sfreq={sfreq}")
+    asr = asrpy.ASR(sfreq=sfreq, cutoff=cutoff)
+    asr.fit(raw_eeg)
+    _stage("asr_transform")
+    return asr.transform(raw_eeg)
+
+
+def _fit_ica_and_labels(
+    raw: mne.io.BaseRaw,
+    asr_thresh: float | int | bool | None,
+    random_seed: int,
+    n_comp: int | None,
+):
+    raw_eeg = raw.copy().pick("eeg")
+    raw_eeg, _ = mne.set_eeg_reference(raw_eeg, ref_channels="average")
+    raw_eeg = _apply_asr(raw_eeg, asr_thresh)
+
+    n_channels = len(raw_eeg.ch_names) - len(raw_eeg.info.get("bads", []))
+    if n_channels < 3:
+        raise RuntimeError(f"ICA requires at least 3 usable EEG channels; found {n_channels}")
+    if n_comp is None:
+        n_comp = min(n_channels - 1, 48)
+    if not 1 < int(n_comp) < n_channels:
+        raise ValueError(
+            f"ICA n_components must be between 2 and {n_channels - 1}; got {n_comp}"
+        )
+
+    ica = ICA(
+        n_components=int(n_comp),
+        method="infomax",
+        random_state=random_seed,
+        fit_params={"extended": True},
+        max_iter="auto",
+    )
+    decim = _ica_decimation(raw_eeg)
+    _stage(f"ica_fit:n={n_comp}:decim={decim}")
+    ica.fit(raw_eeg, decim=decim, reject_by_annotation=True, verbose=False)
+
+    inst_for_iclabel = _iclabel_instance(raw_eeg)
+    labels = _label_ica_components(inst_for_iclabel, ica)
+    if inst_for_iclabel is not raw_eeg:
+        del inst_for_iclabel
+        gc.collect()
+
+    eog_inds: list[int] = []
+    eog_chs = [
+        ch for ch, kind in zip(raw.ch_names, raw.get_channel_types()) if kind == "eog"
+    ]
+    if eog_chs:
+        try:
+            eog_inst = raw_eeg.copy()
+            _add_channels_by_name(eog_inst, raw, eog_chs)
+            eog_inds, _ = ica.find_bads_eog(eog_inst, verbose=False)
+            del eog_inst
+        except Exception:
+            eog_inds = []
+
+    return raw_eeg, ica, labels, list(eog_inds)
+
+
 def run_asr_ica(
     raw: mne.io.BaseRaw,
-    asr_thresh: float | int | bool = 20,
+    asr_thresh: float | int | bool | None = 20,
     random_seed: int = 420,
     n_comp: int | None = None,
     remove_cfa_flag: bool = False,
-) -> tuple[mne.io.BaseRaw, ICA]:
-    raw_eeg = raw.copy().pick('eeg')
-    raw_eeg, _ = mne.set_eeg_reference(raw_eeg, ref_channels='average')
+) -> tuple[mne.io.BaseRaw, ICA, dict[int, str]]:
+    raw_eeg, ica, labels, eog_inds = _fit_ica_and_labels(
+        raw, asr_thresh, random_seed, n_comp
+    )
 
-    if asr_thresh:
-        if asrpy is None:
-            raise RuntimeError("ASR is enabled but the 'asrpy' package is not installed. Disable 'Run ASR' or install asrpy.")
-        asr = asrpy.ASR(sfreq=raw_eeg.info['sfreq'], cutoff=asr_thresh)
-        asr.fit(raw_eeg.copy().resample(100))
-        raw_eeg = asr.transform(raw_eeg)
-
-    n_channels = len(raw_eeg.ch_names) - len(raw_eeg.info.get('bads', []))
-    if n_comp is None:
-        n_comp = max(2, min(n_channels - 1, 48))
-    ica = ICA(n_components=n_comp, method='infomax', random_state=random_seed, fit_params={"extended": True})
-    ica.fit(raw_eeg, decim=3)
-
-    if label_components is None:
-        raise RuntimeError("ICA+ICLabel is enabled but the 'mne_icalabel' package is not installed. Disable 'Run ICA + ICLabel' or install mne-icalabel.")
-    iclabel_result = label_components(raw_eeg, ica, method="iclabel")
-    labels = iclabel_result.get('labels', [])
-    if remove_cfa_flag:
-        bads = [i for i, lab in enumerate(labels) if lab not in ('brain', 'other')]
-        bad_label_dict = {i: label for i, label in enumerate(labels) if i in bads}
-        logging.info(f"ICLabel-based ICA pruning (removing cardiac): {bad_label_dict}")
-    else:
-        bads = [i for i, lab in enumerate(labels) if lab not in ('brain', 'heart', 'other')]
-        bad_label_dict = {i: label for i, label in enumerate(labels) if i in bads}
-        logging.info(f"ICLabel-based ICA pruning (not removing cardiac): {bad_label_dict}")
-
-    # see if there are any EOG leads to help identify EOG components
-    if any(t == 'eog' for t in raw.get_channel_types()):
-        try:
-            eog_inds, _ = ica.find_bads_eog(raw_eeg)
-            bads = sorted(set(bads) | set(eog_inds))
-        except Exception:
-            pass
+    keep_labels = {"brain", "other"}
+    if not remove_cfa_flag:
+        keep_labels.add("heart beat")
+    bads = [
+        index
+        for index, label in enumerate(labels)
+        if _normalise_iclabel_label(label) not in keep_labels
+    ]
+    bads = sorted(set(bads) | set(eog_inds))
+    bad_label_dict = {
+        index: ("eog" if index in eog_inds else labels[index])
+        for index in bads
+        if index < len(labels)
+    }
+    logging.info(
+        "ICLabel-based ICA pruning (%s cardiac): %s",
+        "removing" if remove_cfa_flag else "keeping",
+        bad_label_dict,
+    )
 
     eeg_clean = _apply_ica_excludes(raw_eeg, ica, bads)
     if not ica.exclude:
         bad_label_dict = {}
-    eeg_clean.interpolate_bads(reset_bads=True)
-
-    non_eeg = raw.copy().pick([ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t != 'eeg'])
-    if len(non_eeg.ch_names):
-        eeg_clean.add_channels([non_eeg], force_update_info=True)
-
+    if eeg_clean.info.get("bads"):
+        eeg_clean.interpolate_bads(reset_bads=True)
+    _add_non_eeg_channels(eeg_clean, raw)
     return eeg_clean, ica, bad_label_dict
 
 
 def run_asr_only(
     raw: mne.io.BaseRaw,
-    asr_thresh: float | int | bool = 20,
+    asr_thresh: float | int | bool | None = 20,
 ) -> mne.io.BaseRaw:
     """Apply ASR without ICA/ICLabel, preserving non-EEG channels."""
-    if not asr_thresh:
+    if _normalise_asr_cutoff(asr_thresh) is None:
         return raw
-    if asrpy is None:
-        raise RuntimeError("ASR is enabled but the 'asrpy' package is not installed. Disable 'Run ASR' or install asrpy.")
-    raw_eeg = raw.copy().pick('eeg')
-    raw_eeg, _ = mne.set_eeg_reference(raw_eeg, ref_channels='average')
-    asr = asrpy.ASR(sfreq=raw_eeg.info['sfreq'], cutoff=asr_thresh)
-    asr.fit(raw_eeg.copy().resample(100))
-    eeg_clean = asr.transform(raw_eeg)
-    non_eeg = raw.copy().pick([ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t != 'eeg'])
-    if len(non_eeg.ch_names):
-        eeg_clean.add_channels([non_eeg], force_update_info=True)
+    raw_eeg = raw.copy().pick("eeg")
+    raw_eeg, _ = mne.set_eeg_reference(raw_eeg, ref_channels="average")
+    eeg_clean = _apply_asr(raw_eeg, asr_thresh)
+    _add_non_eeg_channels(eeg_clean, raw)
     return eeg_clean
 
-def detect_r_peaks(raw: mne.io.BaseRaw, stim_channel: str = 'STI 014', gap_threshold_factor: float = 2.0):
-    sfreq = raw.info['sfreq']
-    ecg_chs = [ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t == 'ecg']
+
+def detect_r_peaks(
+    raw: mne.io.BaseRaw,
+    stim_channel: str = "STI 014",
+    gap_threshold_factor: float = 2.0,
+):
+    sfreq = float(raw.info["sfreq"])
+    ecg_chs = [
+        ch for ch, kind in zip(raw.ch_names, raw.get_channel_types()) if kind == "ecg"
+    ]
     if not ecg_chs:
         return raw, []
-    ecg_channel = ecg_chs[0]
-    ecg = raw.get_data(picks=ecg_channel)[0]
-    ecg_cleaned = nk.ecg_clean(ecg, sampling_rate=sfreq)
-    signals, info = nk.ecg_peaks(ecg_cleaned, sampling_rate=sfreq)
-    peaks = info.get('ECG_R_Peaks', None)
-    if peaks is None or len(peaks) < 2:
+    if stim_channel in raw.ch_names:
+        logging.warning(
+            "Stim channel %s already exists; leaving it unchanged and skipping ECG events.",
+            stim_channel,
+        )
         return raw, []
-    rr_samples = np.diff(peaks)
-    rr_sec = rr_samples / sfreq
+
+    _stage("ecg_r_peaks")
+    ecg = raw.get_data(picks=ecg_chs[0])[0]
+    ecg_cleaned = nk.ecg_clean(ecg, sampling_rate=sfreq)
+    _signals, info = nk.ecg_peaks(ecg_cleaned, sampling_rate=sfreq)
+    peaks = np.asarray(info.get("ECG_R_Peaks", []), dtype=int)
+    if peaks.size < 2:
+        return raw, []
+
+    rr_sec = np.diff(peaks) / sfreq
     median_rr = float(np.median(rr_sec))
+    if not np.isfinite(median_rr) or median_rr <= 0:
+        return raw, []
     max_gap = gap_threshold_factor * median_rr
     all_peaks = list(peaks)
     for idx, interval in enumerate(rr_sec):
         if interval > max_gap:
-            n_missing = int(np.round(interval / median_rr)) - 1
-            for j in range(1, n_missing + 1):
-                new_sample = peaks[idx] + int(j * median_rr * sfreq)
-                all_peaks.append(new_sample)
+            n_missing = max(0, int(np.round(interval / median_rr)) - 1)
+            all_peaks.extend(
+                peaks[idx] + int(j * median_rr * sfreq)
+                for j in range(1, n_missing + 1)
+            )
     all_peaks = np.unique(all_peaks).astype(int)
-    events = [(int(s), 0, 1) for s in all_peaks if 0 <= int(s) < raw.n_times]
-    stim_data = np.zeros((1, raw.n_times), dtype=int)
-    for sample, _, _ in events:
-        stim_data[0, sample] = 1
-    info_stim = mne.create_info([stim_channel], sfreq, ch_types=['stim'])
-    stim_raw = mne.io.RawArray(stim_data, info_stim)
+    all_peaks = all_peaks[(all_peaks >= 0) & (all_peaks < raw.n_times)]
+    events = [(int(sample), 0, 1) for sample in all_peaks]
+
+    stim_data = np.zeros((1, raw.n_times), dtype=np.float64)
+    stim_data[0, all_peaks] = 1.0
+    info_stim = mne.create_info([stim_channel], sfreq, ch_types=["stim"])
+    stim_raw = mne.io.RawArray(stim_data, info_stim, verbose=False)
     raw.add_channels([stim_raw], force_update_info=True)
     return raw, events
 
-# ------------------------------- Orchestration ---------------------------- #
 
 def _read_raw_any(input_path: str, *, preload=True, verbose=False) -> mne.io.BaseRaw:
     suffix = Path(input_path).suffix.lower()
@@ -717,6 +1232,61 @@ def _read_raw_any(input_path: str, *, preload=True, verbose=False) -> mne.io.Bas
     if suffix == ".vhdr":
         return mne.io.read_raw_brainvision(input_path, preload=preload, verbose=verbose)
     raise ValueError(f"Unsupported input format: {input_path}")
+
+def _part_fif_path(path: Path, kind: str) -> Path:
+    path = Path(path)
+    token = f".part-{os.getpid()}"
+    name = path.name
+    if kind == "raw":
+        if name.endswith("_raw.fif"):
+            name = name[:-8] + token + "_raw.fif"
+        else:
+            name = path.stem + token + "_raw.fif"
+    elif kind == "ica":
+        if name.endswith("_ica.fif"):
+            name = name[:-8] + token + "_ica.fif"
+        elif name.endswith("-ica.fif"):
+            name = name[:-8] + token + "-ica.fif"
+        else:
+            name = path.stem + token + "_ica.fif"
+    else:
+        raise ValueError(f"Unknown FIF kind: {kind}")
+    return path.with_name(name)
+
+
+def _atomic_save_raw(raw: mne.io.BaseRaw, path: str | Path) -> Path:
+    final = Path(path)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _part_fif_path(final, "raw")
+    temporary.unlink(missing_ok=True)
+    _stage(f"save_raw:{final.name}")
+    try:
+        raw.save(str(temporary), overwrite=True, verbose=False)
+        os.replace(temporary, final)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return final
+
+
+def _atomic_save_ica(ica: ICA, path: str | Path) -> Path:
+    final = Path(path)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _part_fif_path(final, "ica")
+    temporary.unlink(missing_ok=True)
+    _stage(f"save_ica:{final.name}")
+    try:
+        ica.save(str(temporary), overwrite=True, verbose=False)
+        os.replace(temporary, final)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return final
+
+
+def _pyprep_segment_bounds(input_path: str, raw: mne.io.BaseRaw):
+    if _CFG_RT is None or not _CFG_RT.pyprep_by_segment:
+        return None
+    return _snip_sample_bounds_for_input(input_path, raw)
+
 
 def preprocess_edf(
     input_path: str,
@@ -735,276 +1305,232 @@ def preprocess_edf(
     spirometry_dir: str | Path | None = None,
 ):
     if pyprep_dict is None:
-        try:
-            pyprep_dict = prep_params
-        except Exception:
-            if _CFG_RT is not None:
-                pyprep_dict = {
-                    "line_freqs": _CFG_RT.line_freqs,
-                    "ref_chs": _CFG_RT.ref_chs,
-                    "reref_chs": _CFG_RT.reref_chs,
-                    "l_freq": _CFG_RT.high_pass,
-                    "h_freq": _CFG_RT.low_pass,
-                    "ransac": _CFG_RT.prep_ransac,
-                }
-            else:
-                pyprep_dict = {
-                    "line_freqs": (50.0, 100.0),
-                    "ref_chs": "eeg",
-                    "reref_chs": "eeg",
-                    "l_freq": 1.0,
-                    "h_freq": 100.0,
-                    "ransac": True,
-                }
+        pyprep_dict = dict(prep_params)
     if asr_threshold is None:
-        asr_threshold = do_asr
+        asr_threshold = (
+            getattr(_CFG_RT, "asr_cutoff", getattr(_CFG_RT, "use_asr", None))
+            if _CFG_RT is not None
+            else globals().get("do_asr")
+        )
 
-    # resolve output path
     if output_path is None:
         base = Path(input_path).stem + "_pp_raw.fif"
         output_path = str(Path(output_dir) / base)
-
-    # resolve log path (safe default if config.log_file is empty)
     if logging_path is None or str(logging_path).strip() == "":
         logging_path = str(Path(output_dir) / "logs" / "preprocessing.tsv")
 
-    # idempotency
-    if not redo and Path(output_path).exists():
-        logging.info(f"Output exists, skipping: {output_path}")
-        raw_cached = mne.io.read_raw_fif(output_path, preload=True)
-        had_rsp = _has_spirometry_annotations(raw_cached)
+    outp = Path(output_path)
+    if not redo and outp.exists():
+        try:
+            raw_cached = mne.io.read_raw_fif(outp, preload=True, verbose=False)
+        except Exception as exc:
+            logging.warning("Existing output is unreadable and will be replaced: %s", exc)
+            outp.unlink(missing_ok=True)
+        else:
+            logging.info("Output exists and is readable, skipping: %s", outp)
+            had_rsp = _has_spirometry_annotations(raw_cached)
+            spirometry_rec = save_spirometry_analysis(
+                raw_cached,
+                spirometry_channel,
+                spirometry_dir or (Path(output_dir) / "spirometry"),
+                _preproc_base_from_output(outp),
+                redo=False,
+            )
+            if spirometry_rec.get("spirometry_status") == "ok" and not had_rsp:
+                _atomic_save_raw(raw_cached, outp)
+            rec = {
+                "utc": _now_utc_iso(),
+                "status": "OK",
+                "stage": "cached",
+                "input": input_path,
+                "output": str(outp),
+                "n_channels": len(raw_cached.ch_names),
+                "remove_cfa": str(remove_cfa_override),
+                "remove_cfa_mode": str(getattr(_CFG_RT, "remove_cfa_mode", "")),
+                "flip_ecg": str(bool(flip_ecg)),
+            }
+            rec.update(spirometry_rec)
+            _append_preproc_tsv(logging_path, rec)
+            return raw_cached
+
+    try:
+        _stage("read_raw")
+        raw = _read_raw_any(input_path, preload=True, verbose=False)
+
+        aux_like = ["IBI", "BURSTS", "SUPPR", "T1", "T2", "26", "27", "28", "29", "30"]
+        present_aux = [ch for ch in aux_like if ch in raw.ch_names]
+        if present_aux:
+            raw.set_channel_types({ch: "misc" for ch in present_aux})
+        _mark_spirometry_channel(raw, spirometry_channel)
+        _mark_ecg_channels(raw, ecg_channel)
+        if flip_ecg:
+            _flip_ecg_channels(raw, ecg_channel)
+
+        if target_sfreq and not np.isclose(raw.info["sfreq"], float(target_sfreq)):
+            _stage(f"resample:{raw.info['sfreq']}->{target_sfreq}")
+            raw.resample(float(target_sfreq), npad="auto", n_jobs=1)
+
+        if stim_keep:
+            for ch in stim_keep:
+                if ch in raw.ch_names:
+                    raw.set_channel_types({ch: "stim"})
+        _mark_ecg_channels(raw, ecg_channel)
+        _stage("montage")
+        raw = standardise_and_montage(raw)
+        if sum(kind == "eeg" for kind in raw.get_channel_types()) == 0:
+            raise ValueError(
+                "No EEG channels remain after montage/drop; check montage name and channel labels."
+            )
+
+        do_pyprep_flag = bool(
+            getattr(_CFG_RT, "use_pyprep", globals().get("do_pyprep", True))
+        )
+        if do_pyprep_flag:
+            raw = run_pyprep(
+                raw,
+                pyprep_dict,
+                random_seed=random_seed,
+                ransac=bool(
+                    getattr(_CFG_RT, "prep_ransac", pyprep_dict.get("ransac", False))
+                ),
+                channel_wise=bool(getattr(_CFG_RT, "pyprep_channel_wise", False)),
+                max_chunk_size=getattr(_CFG_RT, "pyprep_max_chunk_size", 8),
+                segment_bounds=_pyprep_segment_bounds(input_path, raw),
+            )
+
+        # Filtering is independent of PyPREP.  In the previous implementation,
+        # disabling PyPREP also silently disabled the configured band-pass.
+        raw = _filter_eeg_once(
+            raw,
+            pyprep_dict.get("l_freq", getattr(_CFG_RT, "high_pass", 1.0)),
+            pyprep_dict.get("h_freq", getattr(_CFG_RT, "low_pass", 100.0)),
+        )
+
+        remove_flag = (
+            bool(remove_cfa)
+            if remove_cfa_override is None
+            else bool(remove_cfa_override)
+        )
+        use_ica_flag = bool(getattr(_CFG_RT, "use_ica", True))
+        if use_ica_flag:
+            raw, ica_model, bad_label_dict = run_asr_ica(
+                raw,
+                asr_thresh=asr_threshold,
+                random_seed=random_seed,
+                n_comp=n_comp,
+                remove_cfa_flag=remove_flag,
+            )
+        else:
+            raw = run_asr_only(raw, asr_threshold)
+            ica_model = None
+            bad_label_dict = {}
+
+        raw, events = detect_r_peaks(raw)
+        _stage("spirometry")
         spirometry_rec = save_spirometry_analysis(
-            raw_cached,
+            raw,
             spirometry_channel,
             spirometry_dir or (Path(output_dir) / "spirometry"),
-            _preproc_base_from_output(output_path),
-            redo=False,
+            _preproc_base_from_output(outp),
+            redo=redo,
         )
-        if spirometry_rec.get("spirometry_status") == "ok" and not had_rsp:
-            raw_cached.save(str(output_path), overwrite=True)
+        raw.info["bads"] = []
+        raw.set_meas_date(1)
+        _atomic_save_raw(raw, outp)
+
+        ica_path = ""
+        if ica_model is not None:
+            stem_no_pp = outp.stem.replace("_pp_raw", "")
+            ica_path_obj = outp.with_name(stem_no_pp + "_ica.fif")
+            _atomic_save_ica(ica_model, ica_path_obj)
+            ica_path = str(ica_path_obj)
+
         rec = {
             "utc": _now_utc_iso(),
             "status": "OK",
-            "stage": "cached",
+            "stage": "save",
             "input": input_path,
-            "output": str(output_path),
-            "n_channels": len(raw_cached.ch_names),
-            "remove_cfa": str(remove_cfa_override),
+            "output": str(outp),
+            "n_channels": len(raw.ch_names),
+            "n_events": len(events),
+            "bad_channels": ";".join(raw.info.get("bads", [])),
+            "remove_cfa": str(remove_flag),
             "remove_cfa_mode": str(getattr(_CFG_RT, "remove_cfa_mode", "")),
             "flip_ecg": str(bool(flip_ecg)),
+            "asr_threshold": str(_normalise_asr_cutoff(asr_threshold) or ""),
+            "n_comp": str(n_comp or ""),
+            "stim_keep": ";".join(stim_keep) if stim_keep else "",
+            "montage_name": str(getattr(_CFG_RT, "montage_name", "auto")),
+            "ica_path": ica_path,
+            "ica_bads": ";".join(str(key) for key in sorted(bad_label_dict)),
+            "ica_bad_labels": ";".join(
+                str(bad_label_dict[key]) for key in sorted(bad_label_dict)
+            ),
         }
         rec.update(spirometry_rec)
         _append_preproc_tsv(logging_path, rec)
-        return raw_cached
+        return raw
 
-    # 1) Read raw input (preload)
-    raw = _read_raw_any(input_path, preload=True, verbose=False)
-
-    # 2) Type auxiliaries early (no n_times change)
-    aux_like = ["IBI", "BURSTS", "SUPPR", "T1", "T2", "26", "27", "28", "29", "30"]
-    present_aux = [ch for ch in aux_like if ch in raw.ch_names]
-    if present_aux:
-        raw.set_channel_types({ch: "misc" for ch in present_aux})
-    _mark_spirometry_channel(raw, spirometry_channel)
-    _mark_ecg_channels(raw, ecg_channel)
-
-    # Optional ECG polarity flip
-    if flip_ecg:
-        _flip_ecg_channels(raw, ecg_channel)
-
-    # 3) Global resample once (for identical n_times across all channels)
-    if target_sfreq and not np.isclose(raw.info["sfreq"], float(target_sfreq)):
-        raw.resample(float(target_sfreq), npad="auto")
-
-    # 4) Rename / classify / montage
-    
-    # set stim leads to stim type before montage
-    if stim_keep:
-        for ch in stim_keep:
-            if ch in raw.ch_names:
-                raw.set_channel_types({ch: "stim"})
-
-    _mark_ecg_channels(raw, ecg_channel)
-
-    raw = standardise_and_montage(raw)
-
-    # Sanity: ensure EEG remains
-    if sum(1 for t in raw.get_channel_types() if t == "eeg") == 0:
-        raise ValueError("No EEG channels remain after montage/drop; check montage name and channel labels.")
-
-    # 5) PyPREP on EEG-only; recombine with non-EEG
-    try:
-        do_pyprep_flag = do_pyprep  # global from set_runtime_config
-    except NameError:
-        do_pyprep_flag = getattr(_CFG_RT, "use_pyprep", True)
-    if do_pyprep_flag:
-        raw = run_pyprep(raw, pyprep_dict, random_seed=random_seed, ransac=bool(_CFG_RT.prep_ransac))
-
-    # 6) ASR + ICA (+/- remove cardiac via ICLabel), or ASR-only when ICA is disabled
-    if remove_cfa_override is None:
-        remove_flag = bool(remove_cfa)
-    else:
-        remove_flag = bool(remove_cfa_override)
-    use_ica_flag = bool(getattr(_CFG_RT, "use_ica", True)) if _CFG_RT is not None else True
-    if use_ica_flag:
-        raw, ica_model, bad_label_dict = run_asr_ica(
-            raw,
-            asr_thresh=asr_threshold,
-            random_seed=random_seed,
-            n_comp=n_comp,
-            remove_cfa_flag=remove_flag,
+    except Exception as exc:
+        _append_preproc_tsv(
+            logging_path,
+            {
+                "utc": _now_utc_iso(),
+                "status": "FAIL",
+                "stage": "preprocess_edf",
+                "input": input_path,
+                "output": str(outp),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
         )
-    else:
-        raw = run_asr_only(raw, asr_threshold)
-        ica_model = None
-        bad_label_dict = {}
-
-    # 7) ECG → R-peaks → stim events
-    raw, events = detect_r_peaks(raw)
-    outp = Path(output_path)
-    spirometry_rec = save_spirometry_analysis(
-        raw,
-        spirometry_channel,
-        spirometry_dir or (Path(output_dir) / "spirometry"),
-        _preproc_base_from_output(outp),
-        redo=redo,
-    )
-
-    raw.info["bads"] = []  # clear any stragglers
-
-    # 8) Save (guard empty parents)
-    if str(outp.parent) not in ("", "."):
-        outp.parent.mkdir(parents=True, exist_ok=True)
-    raw.set_meas_date(1)
-    raw.save(str(outp), overwrite=True)
-
-    # save ICA separately (fail fast if it cannot be written)
-    ica_path = ""
-    if ica_model is not None:
-        stem_no_pp = outp.stem.replace("_pp_raw", "")
-        ica_path = outp.with_name(stem_no_pp + "_ica.fif")
-        ica_path.parent.mkdir(parents=True, exist_ok=True)
-        ica_model.save(str(ica_path), overwrite=True)
-
-    # 9) Log (guard empty parents)
-    rec = {
-        'input': input_path,
-        'output': str(outp),
-        'n_channels': len(raw.ch_names),
-        'n_events': len(events),
-        'bad_channels': ';'.join(raw.info.get('bads', [])) if raw.info.get('bads') else '',
-        'remove_cfa': str(remove_flag),
-        'remove_cfa_mode': str(getattr(_CFG_RT, "remove_cfa_mode", "")),
-        'flip_ecg': str(bool(flip_ecg)),
-        'asr_threshold': str(asr_threshold),
-        'n_comp': str(n_comp),
-        'stim_keep': ";".join(stim_keep) if stim_keep else "",
-        'ica_path': ica_path,
-        'channels_dropped': str(len(drop_candidates)) if 'drop_candidates' in locals() else "0",
-        'montage_name': str(getattr(_CFG_RT, "montage_name", "auto")),
-        'ica_bads': ';'.join(str(key) for key in bad_label_dict.keys()),
-        'ica_bad_labels': ';'.join(str(val) for val in bad_label_dict.values()),
-    }
-    rec.update(spirometry_rec)
-    logp = Path(logging_path)
-    if str(logp.parent) not in ("", "."):
-        logp.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = logp.exists() and logp.stat().st_size > 0
-    with open(str(logp), 'a', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=rec.keys(), delimiter='\t')
-        if not file_exists:
-            w.writeheader()
-        w.writerow(rec)
-
-    return raw
-
+        raise
 
 
 
 def _fit_asr_ica_iclabel_once(
     raw: mne.io.BaseRaw,
-    asr_thresh: float | int | bool = 20,
+    asr_thresh: float | int | bool | None = 20,
     random_seed: int = 420,
     n_comp: int | None = None,
 ):
-    """Run (optional) ASR, fit ICA once, and run ICLabel.
-
-    Returns
-    -------
-    raw_eeg_proc : mne.io.BaseRaw
-        EEG-only data after referencing and optional ASR, used for ICA fitting.
-    ica : mne.preprocessing.ICA
-        Fitted ICA model.
-    labels : list[str]
-        ICLabel class label per component.
-    bad_label_dict : dict[int, str]
-        Mapping from excluded component index to ICLabel label for the *remove-CFA* rule
-        (i.e. excluding anything not in ('brain','other')).
-    bad_label_dict_keep : dict[int, str]
-        Mapping for the *keep-CFA* rule (i.e. excluding anything not in ('brain','heart','other')).
-    eog_inds : list[int]
-        Components additionally flagged by find_bads_eog (may be empty).
-    """
-    raw_eeg = raw.copy().pick('eeg')
-    raw_eeg, _ = mne.set_eeg_reference(raw_eeg, ref_channels='average')
-
-    # Optional ASR (fit at 100 Hz to reduce cost, consistent with existing code)
-    if asr_thresh:
-        if asrpy is None:
-            raise RuntimeError("ASR is enabled but the 'asrpy' package is not installed. Disable 'Run ASR' or install asrpy.")
-        asr = asrpy.ASR(sfreq=raw_eeg.info['sfreq'], cutoff=asr_thresh)
-        asr.fit(raw_eeg.copy().resample(100))
-        raw_eeg = asr.transform(raw_eeg)
-
-    n_channels = len(raw_eeg.ch_names) - len(raw_eeg.info.get('bads', []))
-    if n_comp is None:
-        n_comp = max(2, min(n_channels - 1, 48))
-
-    ica = ICA(
-        n_components=n_comp,
-        method='infomax',
-        random_state=random_seed,
-        fit_params={"extended": True},
+    """Run optional ASR, fit ICA once, and derive both ICLabel rules."""
+    raw_eeg, ica, labels, eog_inds = _fit_ica_and_labels(
+        raw, asr_thresh, random_seed, n_comp
     )
-    ica.fit(raw_eeg, decim=3)
+    labels = [_normalise_iclabel_label(label) for label in labels]
 
-    # ICLabel expects 1–100 Hz bandpass; use a filtered *copy* for feature extraction.
-    inst_for_iclabel = raw_eeg.copy()
-    try:
-        inst_for_iclabel.filter(l_freq=1.0, h_freq=100.0, fir_design='firwin', verbose=False)
-    except Exception:
-        # If filtering fails for some reason, proceed (mne_icalabel will likely warn / fail).
-        pass
+    bads_remove = [
+        index for index, label in enumerate(labels) if label not in {"brain", "other"}
+    ]
+    bads_keep = [
+        index
+        for index, label in enumerate(labels)
+        if label not in {"brain", "heart beat", "other"}
+    ]
+    bads_remove = sorted(set(bads_remove) | set(eog_inds))
+    bads_keep = sorted(set(bads_keep) | set(eog_inds))
 
-    if label_components is None:
-        raise RuntimeError("ICA+ICLabel is enabled but the 'mne_icalabel' package is not installed. Disable 'Run ICA + ICLabel' or install mne-icalabel.")
-    iclabel_result = label_components(inst_for_iclabel, ica, method="iclabel")
-    labels = list(iclabel_result.get('labels', []))
-
-    bads_remove = [i for i, lab in enumerate(labels) if lab not in ('brain', 'other')]
-    bads_keep = [i for i, lab in enumerate(labels) if lab not in ('brain', 'heart', 'other')]
-
-    bad_label_dict_remove = {i: labels[i] for i in bads_remove if i < len(labels)}
-    bad_label_dict_keep = {i: labels[i] for i in bads_keep if i < len(labels)}
-
-    # EOG-based IC detection (optional)
-    eog_inds = []
-    if any(t == 'eog' for t in raw.get_channel_types()):
-        try:
-            eog_inds, _ = ica.find_bads_eog(raw_eeg)
-        except Exception:
-            eog_inds = []
-
-    if eog_inds:
-        # EOG inds should be excluded in both variants
-        bads_remove = sorted(set(bads_remove) | set(eog_inds))
-        bads_keep = sorted(set(bads_keep) | set(eog_inds))
-        for i in eog_inds:
-            if i < len(labels):
-                bad_label_dict_remove.setdefault(i, "eog")
-                bad_label_dict_keep.setdefault(i, "eog")
-
-    return raw_eeg, ica, labels, bads_remove, bads_keep, bad_label_dict_remove, bad_label_dict_keep, eog_inds
+    bad_map_remove = {
+        index: ("eog" if index in eog_inds else labels[index])
+        for index in bads_remove
+        if index < len(labels)
+    }
+    bad_map_keep = {
+        index: ("eog" if index in eog_inds else labels[index])
+        for index in bads_keep
+        if index < len(labels)
+    }
+    return (
+        raw_eeg,
+        ica,
+        labels,
+        bads_remove,
+        bads_keep,
+        bad_map_remove,
+        bad_map_keep,
+        eog_inds,
+    )
 
 
 def preprocess_edf_both(
@@ -1023,188 +1549,230 @@ def preprocess_edf_both(
     spirometry_channel: str | None = None,
     spirometry_dir: str | Path | None = None,
 ):
-    """Preprocess once up to ICA+ICLabel, then write *two* outputs.
-
-    - **remove**: excludes ICLabel components not in ('brain','other')
-    - **keep**: excludes ICLabel components not in ('brain','heart','other')
-
-    This avoids running read/resample/montage/PyPREP/ASR/ICA/ICLabel twice.
-    """
-    # Resolve log path
+    """Preprocess once, then save cardiac-removed and cardiac-retained variants."""
     if logging_path is None or str(logging_path).strip() == "":
         logging_path = str(Path(output_dir) / "logs" / "preprocessing.tsv")
+    if pyprep_dict is None:
+        pyprep_dict = dict(prep_params)
+    if asr_threshold is None:
+        asr_threshold = (
+            getattr(_CFG_RT, "asr_cutoff", getattr(_CFG_RT, "use_asr", None))
+            if _CFG_RT is not None
+            else globals().get("do_asr")
+        )
 
-    # Idempotency
-    if (not redo) and Path(output_path_remove).exists() and Path(output_path_keep).exists():
-        logging.info("Both outputs exist, skipping: %s AND %s", output_path_remove, output_path_keep)
-        raw_remove = mne.io.read_raw_fif(output_path_remove, preload=True)
-        raw_keep = mne.io.read_raw_fif(output_path_keep, preload=True)
-        for raw_cached, out_path in ((raw_remove, output_path_remove), (raw_keep, output_path_keep)):
-            had_rsp = _has_spirometry_annotations(raw_cached)
+    output_remove = Path(output_path_remove)
+    output_keep = Path(output_path_keep)
+    if not redo and output_remove.exists() and output_keep.exists():
+        readable = True
+        for out_path in (output_remove, output_keep):
+            try:
+                cached = mne.io.read_raw_fif(out_path, preload=True, verbose=False)
+            except Exception as exc:
+                logging.warning("Unreadable cached output %s: %s", out_path, exc)
+                out_path.unlink(missing_ok=True)
+                readable = False
+                continue
+            had_rsp = _has_spirometry_annotations(cached)
             spirometry_rec = save_spirometry_analysis(
-                raw_cached,
+                cached,
                 spirometry_channel,
                 spirometry_dir or (Path(output_dir) / "spirometry"),
                 _preproc_base_from_output(out_path),
                 redo=False,
             )
             if spirometry_rec.get("spirometry_status") == "ok" and not had_rsp:
-                raw_cached.save(str(out_path), overwrite=True)
+                _atomic_save_raw(cached, out_path)
             rec = {
                 "utc": _now_utc_iso(),
                 "status": "OK",
                 "stage": "cached",
                 "input": input_path,
                 "output": str(out_path),
-                "n_channels": len(raw_cached.ch_names),
+                "n_channels": len(cached.ch_names),
                 "remove_cfa_mode": "both",
                 "flip_ecg": str(bool(flip_ecg)),
             }
             rec.update(spirometry_rec)
             _append_preproc_tsv(logging_path, rec)
-        return raw_remove, raw_keep
+            del cached
+        if readable:
+            return (
+                mne.io.read_raw_fif(output_remove, preload=False, verbose=False),
+                mne.io.read_raw_fif(output_keep, preload=False, verbose=False),
+            )
 
-    # Shared steps: read, resample, montage, PyPREP
     try:
-        # (1) Read
+        _stage("read_raw")
         raw = _read_raw_any(input_path, preload=True, verbose=False)
 
-        # (2) Re-type obvious aux channels (keep consistent with preprocess_edf)
         aux_like = ["IBI", "BURSTS", "SUPPR", "T1", "T2", "26", "27", "28", "29", "30"]
         present_aux = [ch for ch in aux_like if ch in raw.ch_names]
         if present_aux:
             raw.set_channel_types({ch: "misc" for ch in present_aux})
         _mark_spirometry_channel(raw, spirometry_channel)
         _mark_ecg_channels(raw, ecg_channel)
-
-        # Flip ECG if requested
         if flip_ecg:
             _flip_ecg_channels(raw, ecg_channel)
 
-        # (3) Resample
         if target_sfreq and not np.isclose(raw.info["sfreq"], float(target_sfreq)):
-            raw.resample(float(target_sfreq), npad="auto")
+            _stage(f"resample:{raw.info['sfreq']}->{target_sfreq}")
+            raw.resample(float(target_sfreq), npad="auto", n_jobs=1)
 
-        # (4) Mark stim + ecg by name before montage
         if stim_keep:
             for ch in stim_keep:
                 if ch in raw.ch_names:
                     raw.set_channel_types({ch: "stim"})
         _mark_ecg_channels(raw, ecg_channel)
-
-        # (5) Standardise and apply montage (drops EEG channels not in montage)
+        _stage("montage")
         raw = standardise_and_montage(raw)
+        if sum(kind == "eeg" for kind in raw.get_channel_types()) == 0:
+            raise ValueError(
+                "No EEG channels remain after montage/drop; check montage name and channel labels."
+            )
 
-        if sum(1 for t in raw.get_channel_types() if t == "eeg") == 0:
-            raise ValueError("No EEG channels remain after montage/drop; check montage name and channel labels.")
+        if bool(getattr(_CFG_RT, "use_pyprep", globals().get("do_pyprep", True))):
+            raw = run_pyprep(
+                raw,
+                pyprep_dict,
+                random_seed=random_seed,
+                ransac=bool(
+                    getattr(_CFG_RT, "prep_ransac", pyprep_dict.get("ransac", False))
+                ),
+                channel_wise=bool(getattr(_CFG_RT, "pyprep_channel_wise", False)),
+                max_chunk_size=getattr(_CFG_RT, "pyprep_max_chunk_size", 8),
+                segment_bounds=_pyprep_segment_bounds(input_path, raw),
+            )
 
-        # (6) PyPREP
-        if pyprep_dict is None:
-            pyprep_dict = prep_params
-        do_pyprep_flag = True
-        try:
-            do_pyprep_flag = bool(do_pyprep)
-        except Exception:
-            if _CFG_RT is not None:
-                do_pyprep_flag = bool(_CFG_RT.use_pyprep)
-        if do_pyprep_flag:
-            raw = run_pyprep(raw, pyprep_dict, random_seed=random_seed, ransac=bool(_CFG_RT.prep_ransac))
-
-        # (7) ASR + ICA + ICLabel once
-        if asr_threshold is None:
-            asr_threshold = do_asr
-
-        raw_eeg_proc, ica, labels, bads_remove, bads_keep, bad_map_remove, bad_map_keep, eog_inds = _fit_asr_ica_iclabel_once(
+        raw = _filter_eeg_once(
             raw,
-            asr_thresh=asr_threshold,
-            random_seed=420 + int(random_seed),
-            n_comp=n_comp,
+            pyprep_dict.get("l_freq", getattr(_CFG_RT, "high_pass", 1.0)),
+            pyprep_dict.get("h_freq", getattr(_CFG_RT, "low_pass", 100.0)),
         )
 
-        non_eeg = raw.copy().pick([ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t != 'eeg'])
+        # ECG and respiration depend only on auxiliary channels, so calculate
+        # them once rather than once for each ICA exclusion rule.
+        raw, events = detect_r_peaks(raw)
+        _stage("spirometry")
+        spirometry_rec = save_spirometry_analysis(
+            raw,
+            spirometry_channel,
+            spirometry_dir or (Path(output_dir) / "spirometry"),
+            _preproc_base_from_output(output_remove),
+            redo=redo,
+        )
 
-        def _apply_and_recombine(exclude, variant_label_dict):
-            ica_local = ica.copy()
-            eeg_clean = _apply_ica_excludes(raw_eeg_proc, ica_local, list(exclude))
-            if not ica_local.exclude:
-                variant_label_dict = {}
-            try:
-                eeg_clean.interpolate_bads(reset_bads=True)
-            except Exception:
-                pass
-            if len(non_eeg.ch_names):
-                eeg_clean.add_channels([non_eeg], force_update_info=True)
-            # R-peak events
-            eeg_clean, events = detect_r_peaks(eeg_clean)
-            spirometry_rec = save_spirometry_analysis(
-                eeg_clean,
-                spirometry_channel,
-                spirometry_dir or (Path(output_dir) / "spirometry"),
-                _preproc_base_from_output(output_path_remove),
-                redo=redo,
+        use_ica_flag = bool(getattr(_CFG_RT, "use_ica", True))
+        if use_ica_flag:
+            (
+                raw_eeg_proc,
+                ica,
+                _labels,
+                bads_remove,
+                bads_keep,
+                bad_map_remove,
+                bad_map_keep,
+                _eog_inds,
+            ) = _fit_asr_ica_iclabel_once(
+                raw,
+                asr_thresh=asr_threshold,
+                random_seed=random_seed,
+                n_comp=n_comp,
             )
-            eeg_clean.info["bads"] = []
-            return eeg_clean, events, variant_label_dict, ica_local, spirometry_rec
 
-        raw_remove, events_remove, bad_labels_remove, ica_remove, spirometry_remove = _apply_and_recombine(bads_remove, bad_map_remove)
-        raw_keep, events_keep, bad_labels_keep, ica_keep, spirometry_keep = _apply_and_recombine(bads_keep, bad_map_keep)
+            variants = (
+                (output_remove, "remove", bads_remove, bad_map_remove),
+                (output_keep, "keep", bads_keep, bad_map_keep),
+            )
+            for outp, mode, excludes, label_map in variants:
+                ica_local = ica.copy()
+                raw_out = _apply_ica_excludes(raw_eeg_proc, ica_local, list(excludes))
+                if not ica_local.exclude:
+                    label_map = {}
+                if raw_out.info.get("bads"):
+                    raw_out.interpolate_bads(reset_bads=True)
+                _add_non_eeg_channels(raw_out, raw)
+                raw_out.info["bads"] = []
+                raw_out.set_meas_date(1)
+                _atomic_save_raw(raw_out, outp)
 
-        # (8) Save both raws + ICA models
-        for outp_str, raw_out, ica_out, bad_labels, events, mode in [
-            (output_path_remove, raw_remove, ica_remove, bad_labels_remove, events_remove, "remove"),
-            (output_path_keep, raw_keep, ica_keep, bad_labels_keep, events_keep, "keep"),
-        ]:
-            outp = Path(outp_str)
-            outp.parent.mkdir(parents=True, exist_ok=True)
-            raw_out.set_meas_date(1)
-            raw_out.save(str(outp), overwrite=True)
-
-            ica_path = ""
-            try:
                 stem_no_pp = outp.stem.replace("_pp_raw", "")
-                ica_path = str(outp.with_name(stem_no_pp + "_ica.fif"))
-                Path(ica_path).parent.mkdir(parents=True, exist_ok=True)
-                ica_out.save(ica_path, overwrite=True)
-            except Exception:
-                ica_path = ""
+                ica_path = outp.with_name(stem_no_pp + "_ica.fif")
+                _atomic_save_ica(ica_local, ica_path)
 
-            rec = {
-                "utc": _now_utc_iso(),
-                "status": "OK",
-                "stage": "save",
-                "input": input_path,
-                "output": str(outp),
-                "n_channels": len(raw_out.ch_names),
-                "n_events": len(events),
-                "bad_channels": ';'.join(raw_out.info.get('bads', [])) if raw_out.info.get('bads') else '',
-                "remove_cfa": str(mode == "remove"),
-                "remove_cfa_mode": "both",
-                "flip_ecg": str(bool(flip_ecg)),
-                "asr_threshold": str(asr_threshold),
-                "n_comp": str(n_comp),
-                "stim_keep": ";".join(stim_keep) if stim_keep else "",
-                "montage_name": str(getattr(_CFG_RT, "montage_name", "auto")),
-                "ica_path": ica_path,
-                "ica_bads": ';'.join(str(k) for k in sorted(bad_labels.keys())),
-                "ica_bad_labels": ';'.join(str(bad_labels[k]) for k in sorted(bad_labels.keys())),
-            }
-            rec.update(spirometry_remove if mode == "remove" else spirometry_keep)
-            _append_preproc_tsv(logging_path, rec)
+                rec = {
+                    "utc": _now_utc_iso(),
+                    "status": "OK",
+                    "stage": "save",
+                    "input": input_path,
+                    "output": str(outp),
+                    "n_channels": len(raw_out.ch_names),
+                    "n_events": len(events),
+                    "bad_channels": "",
+                    "remove_cfa": str(mode == "remove"),
+                    "remove_cfa_mode": "both",
+                    "flip_ecg": str(bool(flip_ecg)),
+                    "asr_threshold": str(_normalise_asr_cutoff(asr_threshold) or ""),
+                    "n_comp": str(n_comp or ""),
+                    "stim_keep": ";".join(stim_keep) if stim_keep else "",
+                    "montage_name": str(getattr(_CFG_RT, "montage_name", "auto")),
+                    "ica_path": str(ica_path),
+                    "ica_bads": ";".join(str(key) for key in sorted(label_map)),
+                    "ica_bad_labels": ";".join(
+                        str(label_map[key]) for key in sorted(label_map)
+                    ),
+                }
+                rec.update(spirometry_rec)
+                _append_preproc_tsv(logging_path, rec)
+                del raw_out, ica_local
+                gc.collect()
+        else:
+            processed = run_asr_only(raw, asr_threshold)
+            processed.info["bads"] = []
+            processed.set_meas_date(1)
+            for outp, mode in ((output_remove, "remove"), (output_keep, "keep")):
+                _atomic_save_raw(processed, outp)
+                rec = {
+                    "utc": _now_utc_iso(),
+                    "status": "OK",
+                    "stage": "save_no_ica",
+                    "input": input_path,
+                    "output": str(outp),
+                    "n_channels": len(processed.ch_names),
+                    "n_events": len(events),
+                    "bad_channels": "",
+                    "remove_cfa": str(mode == "remove"),
+                    "remove_cfa_mode": "both",
+                    "flip_ecg": str(bool(flip_ecg)),
+                    "asr_threshold": str(_normalise_asr_cutoff(asr_threshold) or ""),
+                    "n_comp": "",
+                    "stim_keep": ";".join(stim_keep) if stim_keep else "",
+                    "montage_name": str(getattr(_CFG_RT, "montage_name", "auto")),
+                }
+                rec.update(spirometry_rec)
+                _append_preproc_tsv(logging_path, rec)
 
-        return raw_remove, raw_keep
+        return (
+            mne.io.read_raw_fif(output_remove, preload=False, verbose=False),
+            mne.io.read_raw_fif(output_keep, preload=False, verbose=False),
+        )
 
-    except Exception as e:
+    except Exception as exc:
         logging.exception("preprocess_edf_both failed for %s", input_path)
-        _append_preproc_tsv(logging_path, {
-            "utc": _now_utc_iso(),
-            "status": "FAIL",
-            "stage": "preprocess_edf_both",
-            "input": input_path,
-            "output": f"{output_path_remove} | {output_path_keep}",
-            "error_type": type(e).__name__,
-            "error": str(e),
-        })
+        _append_preproc_tsv(
+            logging_path,
+            {
+                "utc": _now_utc_iso(),
+                "status": "FAIL",
+                "stage": "preprocess_edf_both",
+                "input": input_path,
+                "output": f"{output_remove} | {output_keep}",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
         raise
+
 
 # ----------------------------------- CLI (optional) ----------------------- #
 if __name__ == "__main__":
